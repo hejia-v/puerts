@@ -348,6 +348,14 @@ export function handleHttpDelete(sessionId: string): void {
 }
 
 /**
+ * Release all active upstream sessions without tearing down the server itself.
+ * Used by the Unity debug/reset endpoint so external clients can recover from stale ownership.
+ */
+export function handleReset(): void {
+    destroyAllSessions();
+}
+
+/**
  * Shut down the MCP Server.
  * Called from C# McpScriptManager.Shutdown().
  */

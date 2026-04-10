@@ -57,6 +57,13 @@ namespace PuertsMcp
         // Called when a GET SSE stream is opened
         public Action OnSseStreamOpened;
 
+        // Debug / health callbacks
+        public Func<string> OnHealthRequest;
+        public Func<string> OnDebugEditorStateRequest;
+        public Func<int, int, string> OnDebugWaitReadyRequest;
+        public Func<string> OnDebugSessionRequest;
+        public Func<string> OnDebugResetRequest;
+
         public McpHttpServer(int port)
         {
             _port = port;
@@ -119,6 +126,42 @@ namespace PuertsMcp
         public void Dispose()
         {
             Stop();
+        }
+
+        public int RegisteredSessionCount
+        {
+            get
+            {
+                lock (_sessionLock)
+                {
+                    return _sessions.Count;
+                }
+            }
+        }
+
+        public int ActiveGetStreamCount => _getStreams.Count;
+
+        public int PendingPostStreamCount => _postStreams.Count;
+
+        public void ResetAllConnections()
+        {
+            foreach (var kvp in _getStreams)
+            {
+                try { kvp.Value.Close(); } catch { }
+            }
+            _getStreams.Clear();
+
+            foreach (var kvp in _postStreams)
+            {
+                try { kvp.Value.Close(); } catch { }
+            }
+            _postStreams.Clear();
+            _contextToSession.Clear();
+
+            lock (_sessionLock)
+            {
+                _sessions.Clear();
+            }
         }
 
         // -------------------------------------------------------------------
@@ -354,12 +397,44 @@ namespace PuertsMcp
                 // Health check
                 if (path == "/health" && request.HttpMethod == "GET")
                 {
-                    var body = Encoding.UTF8.GetBytes("{\"status\":\"ok\",\"server\":\"unity-puerts-mcp\"}");
-                    response.StatusCode = 200;
-                    response.ContentType = "application/json";
-                    response.ContentLength64 = body.Length;
-                    response.OutputStream.Write(body, 0, body.Length);
-                    response.Close();
+                    SendJson(response, 200, OnHealthRequest?.Invoke() ?? "{\"status\":\"ok\",\"server\":\"unity-puerts-mcp\"}");
+                    return;
+                }
+
+                if (path == "/debug/editor-state" && request.HttpMethod == "GET")
+                {
+                    SendJson(response, 200, OnDebugEditorStateRequest?.Invoke() ?? "{\"ready\":false}");
+                    return;
+                }
+
+                if (path == "/debug/wait-ready" && request.HttpMethod == "GET")
+                {
+                    int timeoutMs = 15000;
+                    int pollMs = 250;
+
+                    if (int.TryParse(request.QueryString["timeoutMs"], out var parsedTimeout))
+                    {
+                        timeoutMs = parsedTimeout;
+                    }
+
+                    if (int.TryParse(request.QueryString["pollMs"], out var parsedPoll))
+                    {
+                        pollMs = parsedPoll;
+                    }
+
+                    SendJson(response, 200, OnDebugWaitReadyRequest?.Invoke(timeoutMs, pollMs) ?? "{\"ready\":false}");
+                    return;
+                }
+
+                if (path == "/debug/session" && request.HttpMethod == "GET")
+                {
+                    SendJson(response, 200, OnDebugSessionRequest?.Invoke() ?? "{\"hasTransport\":false}");
+                    return;
+                }
+
+                if (path == "/debug/reset" && request.HttpMethod == "POST")
+                {
+                    SendJson(response, 200, OnDebugResetRequest?.Invoke() ?? "{\"success\":true}");
                     return;
                 }
 
@@ -520,15 +595,20 @@ namespace PuertsMcp
         {
             try
             {
-                var json = $"{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":{code},\"message\":\"{EscapeJson(message)}\"}},\"id\":null}}";
-                var data = Encoding.UTF8.GetBytes(json);
-                response.StatusCode = statusCode;
-                response.ContentType = "application/json";
-                response.ContentLength64 = data.Length;
-                response.OutputStream.Write(data, 0, data.Length);
-                response.Close();
+                SendJson(response, statusCode,
+                    $"{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":{code},\"message\":\"{EscapeJson(message)}\"}},\"id\":null}}");
             }
             catch { }
+        }
+
+        private void SendJson(HttpListenerResponse response, int statusCode, string jsonBody)
+        {
+            var data = Encoding.UTF8.GetBytes(jsonBody);
+            response.StatusCode = statusCode;
+            response.ContentType = "application/json";
+            response.ContentLength64 = data.Length;
+            response.OutputStream.Write(data, 0, data.Length);
+            response.Close();
         }
 
         private void SendJsonError(string requestContextId, int statusCode, int code, string message)

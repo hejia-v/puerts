@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using UnityEngine;
 using Puerts;
 #if UNITY_EDITOR
@@ -25,8 +26,17 @@ namespace PuertsMcp
         private Action onShutdown;
         private Action<string, string, string, string> handleHttpPost;
         private Action<string> handleHttpDelete;
+        private Action handleReset;
 
         private const string EntryModule = "McpServer/main.mjs";
+        private const string SessionKeyBootId = "PuertsMcp_BootId";
+        private const string SessionKeyBootedAt = "PuertsMcp_BootedAt";
+        private const string SessionKeyServerGeneration = "PuertsMcp_ServerGeneration";
+
+        private string bootId;
+        private string bootedAt;
+        private int serverGeneration;
+        private int mainThreadId;
 
         /// <summary>
         /// Whether the MCP Server TS module has been successfully loaded and the server is running.
@@ -54,6 +64,10 @@ namespace PuertsMcp
 
             try
             {
+                mainThreadId = Thread.CurrentThread.ManagedThreadId;
+                EnsureLifecycleMetadata();
+                Application.runInBackground = true;
+
                 scriptEnv = new ScriptEnv(new BackendV8());
 
                 ScriptObject moduleExports = scriptEnv.ExecuteModule(EntryModule);
@@ -63,6 +77,7 @@ namespace PuertsMcp
                 onShutdown = moduleExports.Get<Action>("onShutdown");
                 handleHttpPost = moduleExports.Get<Action<string, string, string, string>>("handleHttpPost");
                 handleHttpDelete = moduleExports.Get<Action<string>>("handleHttpDelete");
+                handleReset = moduleExports.Get<Action>("handleReset");
 
                 if (onInitialize == null)
                 {
@@ -76,6 +91,11 @@ namespace PuertsMcp
 
                 // Create and start the C# HTTP server
                 httpServer = new McpHttpServer(port);
+                httpServer.OnHealthRequest = CreateHealthResponseJson;
+                httpServer.OnDebugEditorStateRequest = CreateEditorStateResponseJson;
+                httpServer.OnDebugWaitReadyRequest = CreateWaitReadyResponseJson;
+                httpServer.OnDebugSessionRequest = CreateSessionResponseJson;
+                httpServer.OnDebugResetRequest = HandleDebugResetRequest;
 
                 // Wire up HTTP callbacks to JS handlers
                 httpServer.OnHttpPost = (requestContextId, method, body, sessionIdHeader) =>
@@ -267,6 +287,7 @@ namespace PuertsMcp
             onShutdown = null;
             handleHttpPost = null;
             handleHttpDelete = null;
+            handleReset = null;
             isInitialized = false;
 
             // Stop the C# HTTP server
@@ -321,6 +342,285 @@ namespace PuertsMcp
             }
 #endif
             return System.IO.Path.GetFullPath($"Packages/{packageName}/{resourceFolder}/{relativeResourcePath}");
+        }
+
+        private void EnsureLifecycleMetadata()
+        {
+#if UNITY_EDITOR
+            bootId = SessionState.GetString(SessionKeyBootId, string.Empty);
+            if (string.IsNullOrEmpty(bootId))
+            {
+                bootId = Guid.NewGuid().ToString("N");
+                SessionState.SetString(SessionKeyBootId, bootId);
+            }
+
+            bootedAt = SessionState.GetString(SessionKeyBootedAt, string.Empty);
+            if (string.IsNullOrEmpty(bootedAt))
+            {
+                bootedAt = DateTimeOffset.UtcNow.ToString("O");
+                SessionState.SetString(SessionKeyBootedAt, bootedAt);
+            }
+
+            serverGeneration = SessionState.GetInt(SessionKeyServerGeneration, 0) + 1;
+            SessionState.SetInt(SessionKeyServerGeneration, serverGeneration);
+#else
+            bootId ??= Guid.NewGuid().ToString("N");
+            bootedAt ??= DateTimeOffset.UtcNow.ToString("O");
+            serverGeneration++;
+#endif
+        }
+
+        private T InvokeOnMainThread<T>(Func<T> func, int timeoutMs = 2000)
+        {
+            if (Thread.CurrentThread.ManagedThreadId == mainThreadId)
+            {
+                return func();
+            }
+
+            using (var waitHandle = new ManualResetEventSlim(false))
+            {
+                T result = default;
+                Exception error = null;
+
+                EnqueueMainThread(() =>
+                {
+                    try
+                    {
+                        result = func();
+                    }
+                    catch (Exception ex)
+                    {
+                        error = ex;
+                    }
+                    finally
+                    {
+                        waitHandle.Set();
+                    }
+                });
+
+                if (!waitHandle.Wait(timeoutMs))
+                {
+                    throw new TimeoutException("[McpScriptManager] Timed out waiting for main-thread state snapshot.");
+                }
+
+                if (error != null)
+                {
+                    throw error;
+                }
+
+                return result;
+            }
+        }
+
+        private EditorStateSnapshot CaptureEditorStateSnapshot()
+        {
+#if UNITY_EDITOR
+            var isCompiling = EditorApplication.isCompiling;
+            var isUpdating = EditorApplication.isUpdating;
+            var isPlaying = EditorApplication.isPlaying;
+            var isPlayingOrWillChangePlaymode = EditorApplication.isPlayingOrWillChangePlaymode;
+#else
+            var isCompiling = false;
+            var isUpdating = false;
+            var isPlaying = false;
+            var isPlayingOrWillChangePlaymode = false;
+#endif
+
+            return new EditorStateSnapshot
+            {
+                isCompiling = isCompiling,
+                isUpdating = isUpdating,
+                isPlaying = isPlaying,
+                isPlayingOrWillChangePlaymode = isPlayingOrWillChangePlaymode,
+                serverInitialized = isInitialized,
+                ready = httpServer != null && isInitialized && !isCompiling && !isUpdating,
+            };
+        }
+
+        private string CreateHealthResponseJson()
+        {
+            return JsonUtility.ToJson(new HealthResponse
+            {
+                status = "ok",
+                server = "unity-puerts-mcp",
+                bootId = bootId,
+                bootedAt = bootedAt,
+                serverGeneration = serverGeneration,
+            });
+        }
+
+        private string CreateEditorStateResponseJson()
+        {
+            var snapshot = InvokeOnMainThread(CaptureEditorStateSnapshot);
+            return JsonUtility.ToJson(new EditorStateResponse
+            {
+                isCompiling = snapshot.isCompiling,
+                isUpdating = snapshot.isUpdating,
+                isPlaying = snapshot.isPlaying,
+                isPlayingOrWillChangePlaymode = snapshot.isPlayingOrWillChangePlaymode,
+                serverInitialized = snapshot.serverInitialized,
+                ready = snapshot.ready,
+            });
+        }
+
+        private string CreateWaitReadyResponseJson(int timeoutMs, int pollMs)
+        {
+            timeoutMs = Math.Max(0, timeoutMs);
+            pollMs = Math.Max(50, pollMs);
+
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var timedOut = false;
+            var snapshot = new EditorStateSnapshot();
+
+            while (true)
+            {
+                snapshot = InvokeOnMainThread(CaptureEditorStateSnapshot, Math.Max(2000, pollMs + 500));
+                if (snapshot.ready)
+                {
+                    break;
+                }
+
+                if (stopwatch.ElapsedMilliseconds >= timeoutMs)
+                {
+                    timedOut = true;
+                    break;
+                }
+
+                var remainingMs = timeoutMs - (int)stopwatch.ElapsedMilliseconds;
+                Thread.Sleep(Math.Min(pollMs, Math.Max(1, remainingMs)));
+            }
+
+            return JsonUtility.ToJson(new WaitReadyResponse
+            {
+                ready = snapshot.ready,
+                waitedMs = (int)Math.Min(int.MaxValue, stopwatch.ElapsedMilliseconds),
+                timedOut = timedOut,
+                timeoutMs = timeoutMs,
+                pollMs = pollMs,
+                isCompiling = snapshot.isCompiling,
+                isUpdating = snapshot.isUpdating,
+                isPlaying = snapshot.isPlaying,
+                isPlayingOrWillChangePlaymode = snapshot.isPlayingOrWillChangePlaymode,
+                serverInitialized = snapshot.serverInitialized,
+                bootId = bootId,
+                serverGeneration = serverGeneration,
+            });
+        }
+
+        private string CreateSessionResponseJson()
+        {
+            return JsonUtility.ToJson(new SessionResponse
+            {
+                hasTransport = httpServer != null && httpServer.RegisteredSessionCount > 0,
+                initialized = isInitialized,
+                registeredSessionCount = httpServer?.RegisteredSessionCount ?? 0,
+                activeGetStreamCount = httpServer?.ActiveGetStreamCount ?? 0,
+                pendingPostStreamCount = httpServer?.PendingPostStreamCount ?? 0,
+                lastError = lastError ?? string.Empty,
+                bootId = bootId,
+                serverGeneration = serverGeneration,
+            });
+        }
+
+        private string HandleDebugResetRequest()
+        {
+            var success = true;
+            var message = "Sessions released.";
+
+            try
+            {
+                InvokeOnMainThread(() =>
+                {
+                    handleReset?.Invoke();
+                    httpServer?.ResetAllConnections();
+                    return true;
+                });
+            }
+            catch (Exception ex)
+            {
+                success = false;
+                message = ex.Message;
+                lastError = $"[McpScriptManager] Debug reset failed: {ex.Message}";
+                Debug.LogWarning(lastError);
+            }
+
+            return JsonUtility.ToJson(new ResetResponse
+            {
+                success = success,
+                message = message,
+                bootId = bootId,
+                serverGeneration = serverGeneration,
+            });
+        }
+
+        [Serializable]
+        private class HealthResponse
+        {
+            public string status;
+            public string server;
+            public string bootId;
+            public string bootedAt;
+            public int serverGeneration;
+        }
+
+        [Serializable]
+        private class EditorStateResponse
+        {
+            public bool isCompiling;
+            public bool isUpdating;
+            public bool isPlaying;
+            public bool isPlayingOrWillChangePlaymode;
+            public bool serverInitialized;
+            public bool ready;
+        }
+
+        [Serializable]
+        private class WaitReadyResponse
+        {
+            public bool isCompiling;
+            public bool isUpdating;
+            public bool isPlaying;
+            public bool isPlayingOrWillChangePlaymode;
+            public bool serverInitialized;
+            public bool ready;
+            public int timeoutMs;
+            public int pollMs;
+            public int waitedMs;
+            public bool timedOut;
+            public string bootId;
+            public int serverGeneration;
+        }
+
+        [Serializable]
+        private class SessionResponse
+        {
+            public bool hasTransport;
+            public bool initialized;
+            public int registeredSessionCount;
+            public int activeGetStreamCount;
+            public int pendingPostStreamCount;
+            public string lastError;
+            public string bootId;
+            public int serverGeneration;
+        }
+
+        [Serializable]
+        private class ResetResponse
+        {
+            public bool success;
+            public string message;
+            public string bootId;
+            public int serverGeneration;
+        }
+
+        private struct EditorStateSnapshot
+        {
+            public bool isCompiling;
+            public bool isUpdating;
+            public bool isPlaying;
+            public bool isPlayingOrWillChangePlaymode;
+            public bool serverInitialized;
+            public bool ready;
         }
 
 #if !UNITY_EDITOR

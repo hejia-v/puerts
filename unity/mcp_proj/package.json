@@ -6,7 +6,9 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "build:check": "tsc --noEmit && node esbuild.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "proxy": "node scripts/puerts-unity-proxy.mjs",
+    "proxy:verify": "node scripts/verify-puerts-unity-proxy.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
