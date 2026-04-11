@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.IO;
+using System.Reflection;
 using UnityEngine;
 #if UNITY_EDITOR
 using UnityEditor;
@@ -17,6 +18,10 @@ namespace LLMAgent
     /// </summary>
     public static class ScreenCaptureBridge
     {
+        private const int DefaultMcpMaxResolution = 640;
+        private static MethodInfo s_captureScreenshotMethod;
+        private static bool? s_screenCaptureModuleAvailable;
+
         /// <summary>
         /// Hidden MonoBehaviour singleton that drives coroutines for screen capture.
         /// </summary>
@@ -44,6 +49,10 @@ namespace LLMAgent
                 StartCoroutine(CaptureCoroutine(maxWidth, maxHeight, onComplete));
             }
 
+            public void CaptureScreenForMcp(int maxResolution, bool includeImage, Action<string> onComplete)
+            {
+                StartCoroutine(CaptureCoroutineForMcp(maxResolution, includeImage, onComplete));
+            }
             private IEnumerator CaptureCoroutine(int maxWidth, int maxHeight, Action<string> onComplete)
             {
                 // Wait until end of frame so the screen is fully rendered
@@ -66,6 +75,39 @@ namespace LLMAgent
                 {
                     Debug.LogError($"[ScreenCaptureBridge] Capture failed: {ex.Message}");
                     result = BuildErrorJson(ex.Message);
+                }
+                onComplete?.Invoke(result);
+            }
+
+            private IEnumerator CaptureCoroutineForMcp(int maxResolution, bool includeImage, Action<string> onComplete)
+            {
+                yield return new WaitForEndOfFrame();
+
+                string result;
+                Texture2D screenTex = null;
+                try
+                {
+                    int screenWidth = Screen.width;
+                    int screenHeight = Screen.height;
+
+                    screenTex = new Texture2D(screenWidth, screenHeight, TextureFormat.RGB24, false);
+                    screenTex.ReadPixels(new Rect(0, 0, screenWidth, screenHeight), 0, 0);
+                    screenTex.Apply();
+
+                    result = FinalizeMcpCapture(screenTex, maxResolution, includeImage, "game-view");
+                    screenTex = null;
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[ScreenCaptureBridge] MCP screen capture failed: {ex.Message}");
+                    result = BuildErrorJson(ex.Message);
+                }
+                finally
+                {
+                    if (screenTex != null)
+                    {
+                        UnityEngine.Object.Destroy(screenTex);
+                    }
                 }
 
                 onComplete?.Invoke(result);
@@ -110,6 +152,44 @@ namespace LLMAgent
                 catch (Exception ex)
                 {
                     Debug.LogError($"[ScreenCaptureBridge] Camera capture failed: {ex.Message}");
+                    callback.Invoke(BuildErrorJson(ex.Message));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Capture the current Game view for the MCP screenshot tool.
+        /// The output preserves the current Game view aspect ratio.
+        /// </summary>
+        public static void CaptureScreenForMcpAsync(int maxResolution, bool includeImage, Action<string> callback)
+        {
+            if (callback == null)
+            {
+                Debug.LogError("[ScreenCaptureBridge] Callback is null");
+                return;
+            }
+
+            if (Application.isPlaying)
+            {
+                try
+                {
+                    ScreenCaptureRunner.Instance.CaptureScreenForMcp(maxResolution, includeImage, callback);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[ScreenCaptureBridge] MCP coroutine capture failed: {ex.Message}");
+                    callback.Invoke(BuildErrorJson(ex.Message));
+                }
+            }
+            else
+            {
+                try
+                {
+                    CaptureGameViewForMcpEditorAsync(maxResolution, includeImage, callback);
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogError($"[ScreenCaptureBridge] MCP camera capture failed: {ex.Message}");
                     callback.Invoke(BuildErrorJson(ex.Message));
                 }
             }
@@ -210,6 +290,33 @@ namespace LLMAgent
         }
 
         /// <summary>
+        /// Capture the current Scene view for the MCP screenshot tool.
+        /// </summary>
+        public static void CaptureSceneViewForMcpAsync(int maxResolution, bool includeImage, Action<string> callback)
+        {
+            if (callback == null)
+            {
+                Debug.LogError("[ScreenCaptureBridge] Callback is null");
+                return;
+            }
+
+#if UNITY_EDITOR
+            try
+            {
+                string result = CaptureSceneViewForMcp(maxResolution, includeImage);
+                callback.Invoke(result);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[ScreenCaptureBridge] MCP scene view capture failed: {ex.Message}");
+                callback.Invoke(BuildErrorJson(ex.Message));
+            }
+#else
+            callback.Invoke(BuildErrorJson("Scene view capture is only available in the Unity Editor."));
+#endif
+        }
+
+        /// <summary>
         /// Get the current Scene view camera state (pivot, rotation, size).
         /// Only available in the Unity Editor.
         /// </summary>
@@ -276,6 +383,135 @@ namespace LLMAgent
         }
 
 #if UNITY_EDITOR
+        private static void CaptureGameViewForMcpEditorAsync(int maxResolution, bool includeImage, Action<string> callback)
+        {
+            if (!IsScreenCaptureModuleAvailable)
+            {
+                string fallback = CaptureGameViewForMcp(maxResolution, includeImage);
+                callback.Invoke(fallback);
+                return;
+            }
+
+            string fullPath = SaveMcpScreenshotToTempPath("game-view");
+            EnsureGameViewWindow();
+            s_captureScreenshotMethod.Invoke(null, new object[] { fullPath, 1 });
+
+            double startTime = EditorApplication.timeSinceStartup;
+            bool completed = false;
+
+            void Poll()
+            {
+                if (completed)
+                {
+                    return;
+                }
+
+                try
+                {
+                    if (File.Exists(fullPath))
+                    {
+                        long length = 0;
+                        try { length = new FileInfo(fullPath).Length; } catch { }
+                        if (length > 0)
+                        {
+                            completed = true;
+                            EditorApplication.update -= Poll;
+                            callback.Invoke(ReadMcpScreenshotFromFile(fullPath, maxResolution, includeImage));
+                            return;
+                        }
+                    }
+
+                    if (EditorApplication.timeSinceStartup - startTime > 5d)
+                    {
+                        completed = true;
+                        EditorApplication.update -= Poll;
+                        callback.Invoke(BuildErrorJson("Timed out waiting for Game view screenshot file."));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    completed = true;
+                    EditorApplication.update -= Poll;
+                    callback.Invoke(BuildErrorJson(ex.Message));
+                }
+            }
+
+            EditorApplication.update -= Poll;
+            EditorApplication.update += Poll;
+        }
+
+        private static string CaptureGameViewForMcp(int maxResolution, bool includeImage)
+        {
+            var cam = Camera.main;
+            if (cam == null)
+            {
+                cam = UnityEngine.Object.FindObjectOfType<Camera>();
+            }
+            if (cam == null)
+            {
+                return BuildErrorJson("No camera found in scene. Cannot capture Game view outside Play Mode.");
+            }
+
+            GetGameViewCaptureSize(cam, out int captureWidth, out int captureHeight);
+            return CaptureCameraForMcp(cam, captureWidth, captureHeight, maxResolution, includeImage, "game-view");
+        }
+
+        private static bool IsScreenCaptureModuleAvailable
+        {
+            get
+            {
+                if (!s_screenCaptureModuleAvailable.HasValue)
+                {
+                    Type screenCaptureType = Type.GetType("UnityEngine.ScreenCapture, UnityEngine.ScreenCaptureModule")
+                        ?? Type.GetType("UnityEngine.ScreenCapture, UnityEngine.CoreModule");
+                    s_screenCaptureModuleAvailable = screenCaptureType != null;
+                    if (screenCaptureType != null)
+                    {
+                        s_captureScreenshotMethod = screenCaptureType.GetMethod(
+                            "CaptureScreenshot",
+                            BindingFlags.Static | BindingFlags.Public,
+                            null,
+                            new[] { typeof(string), typeof(int) },
+                            null);
+                    }
+                }
+
+                return s_screenCaptureModuleAvailable.Value && s_captureScreenshotMethod != null;
+            }
+        }
+
+        private static void EnsureGameViewWindow()
+        {
+            try
+            {
+                if (!EditorApplication.ExecuteMenuItem("Window/General/Game"))
+                {
+                    EditorApplication.ExecuteMenuItem("Window/General/Game %2");
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Type gameViewType = Type.GetType("UnityEditor.GameView,UnityEditor");
+                if (gameViewType != null)
+                {
+                    EditorWindow window = EditorWindow.GetWindow(gameViewType);
+                    window?.Repaint();
+                }
+            }
+            catch
+            {
+            }
+
+            try { EditorApplication.QueuePlayerLoopUpdate(); }
+            catch
+            {
+            }
+        }
+
         /// <summary>
         /// Capture the Scene view using SceneView.lastActiveSceneView.camera.
         /// </summary>
@@ -338,6 +574,192 @@ namespace LLMAgent
             UnityEngine.Object.DestroyImmediate(tex);
 
             return BuildSuccessJson(base64, captureWidth, captureHeight);
+        }
+
+        private static string CaptureSceneViewForMcp(int maxResolution, bool includeImage)
+        {
+            SceneView sceneView = SceneView.lastActiveSceneView;
+            if (sceneView == null)
+            {
+                return BuildErrorJson("No active Scene view found. Please open a Scene view window in the Editor.");
+            }
+
+            Camera sceneCamera = sceneView.camera;
+            if (sceneCamera == null)
+            {
+                return BuildErrorJson("Scene view camera is not available.");
+            }
+
+            GetSceneViewCaptureSize(sceneView, sceneCamera, out int captureWidth, out int captureHeight);
+
+            bool previousSceneLighting = sceneView.sceneLighting;
+            try
+            {
+                if (!sceneView.sceneLighting)
+                {
+                    sceneView.sceneLighting = true;
+                    sceneView.Repaint();
+                }
+
+                return CaptureCameraForMcp(sceneCamera, captureWidth, captureHeight, maxResolution, includeImage, "scene-view");
+            }
+            finally
+            {
+                if (sceneView != null && sceneView.sceneLighting != previousSceneLighting)
+                {
+                    sceneView.sceneLighting = previousSceneLighting;
+                    sceneView.Repaint();
+                }
+            }
+        }
+
+        private static string CaptureCameraForMcp(Camera camera, int captureWidth, int captureHeight, int maxResolution, bool includeImage, string filePrefix)
+        {
+            RenderTexture rt = null;
+            Texture2D tex = null;
+            RenderTexture previousTarget = camera.targetTexture;
+            RenderTexture previousActive = RenderTexture.active;
+
+            try
+            {
+                rt = new RenderTexture(captureWidth, captureHeight, 24, RenderTextureFormat.ARGB32);
+                rt.Create();
+
+                camera.targetTexture = rt;
+                camera.Render();
+
+                RenderTexture.active = rt;
+                tex = new Texture2D(captureWidth, captureHeight, TextureFormat.RGB24, false);
+                tex.ReadPixels(new Rect(0, 0, captureWidth, captureHeight), 0, 0);
+                tex.Apply();
+
+                return FinalizeMcpCapture(tex, maxResolution, includeImage, filePrefix);
+            }
+            finally
+            {
+                camera.targetTexture = previousTarget;
+                RenderTexture.active = previousActive;
+                if (rt != null)
+                {
+                    rt.Release();
+                    UnityEngine.Object.DestroyImmediate(rt);
+                }
+            }
+        }
+
+        private static void GetGameViewCaptureSize(Camera camera, out int width, out int height)
+        {
+            if (TryGetMainGameViewSize(out width, out height))
+            {
+                return;
+            }
+
+            width = Mathf.Max(1, camera.pixelWidth > 0 ? camera.pixelWidth : Screen.width);
+            height = Mathf.Max(1, camera.pixelHeight > 0 ? camera.pixelHeight : Screen.height);
+
+            if (width > 0 && height > 0)
+            {
+                return;
+            }
+
+            float aspect = camera.aspect > 0f ? camera.aspect : (16f / 9f);
+            width = DefaultMcpMaxResolution;
+            height = Mathf.Max(1, Mathf.RoundToInt(width / aspect));
+        }
+
+        private static void GetSceneViewCaptureSize(SceneView sceneView, Camera sceneCamera, out int width, out int height)
+        {
+            if (TryGetEditorWindowContentSize(sceneView, out width, out height))
+            {
+                return;
+            }
+
+            width = Mathf.Max(1, sceneCamera.pixelWidth > 0 ? sceneCamera.pixelWidth : Screen.width);
+            height = Mathf.Max(1, sceneCamera.pixelHeight > 0 ? sceneCamera.pixelHeight : Screen.height);
+
+            if (width > 0 && height > 0)
+            {
+                return;
+            }
+
+            float aspect = sceneCamera.aspect > 0f ? sceneCamera.aspect : (16f / 9f);
+            width = DefaultMcpMaxResolution;
+            height = Mathf.Max(1, Mathf.RoundToInt(width / aspect));
+        }
+
+        private static bool TryGetMainGameViewSize(out int width, out int height)
+        {
+            width = 0;
+            height = 0;
+
+            try
+            {
+                Type handlesType = typeof(Editor).Assembly.GetType("UnityEditor.Handles");
+                MethodInfo getMainGameViewSize = handlesType?.GetMethod("GetMainGameViewSize", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                if (getMainGameViewSize != null)
+                {
+                    object value = getMainGameViewSize.Invoke(null, null);
+                    if (value is Vector2 size && size.x > 1f && size.y > 1f)
+                    {
+                        width = Mathf.RoundToInt(size.x);
+                        height = Mathf.RoundToInt(size.y);
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                Type gameViewType = Type.GetType("UnityEditor.GameView,UnityEditor");
+                if (gameViewType == null)
+                {
+                    return false;
+                }
+
+                EditorWindow gameViewWindow = EditorWindow.GetWindow(gameViewType);
+                return TryGetEditorWindowContentSize(gameViewWindow, out width, out height);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryGetEditorWindowContentSize(EditorWindow window, out int width, out int height)
+        {
+            width = 0;
+            height = 0;
+            if (window == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                Rect contentRect = window.rootVisualElement.contentRect;
+                if (contentRect.width > 1f && contentRect.height > 1f)
+                {
+                    width = Mathf.RoundToInt(contentRect.width);
+                    height = Mathf.RoundToInt(contentRect.height);
+                    return true;
+                }
+            }
+            catch
+            {
+            }
+
+            Rect windowRect = window.position;
+            if (windowRect.width > 1f && windowRect.height > 1f)
+            {
+                width = Mathf.RoundToInt(windowRect.width);
+                height = Mathf.RoundToInt(windowRect.height);
+                return true;
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -482,7 +904,7 @@ namespace LLMAgent
             Vector3 newEuler = sceneView.rotation.eulerAngles;
             Debug.Log($"[ScreenCaptureBridge] Scene view orbit {direction}: rotation {oldEuler} -> {newEuler}");
             return BuildManipulationSuccessJson("orbit", direction, amount,
-                $"Orbited {direction} by {angleDeg:F1}°. Rotation: ({oldEuler.x:F1}, {oldEuler.y:F1}, {oldEuler.z:F1}) -> ({newEuler.x:F1}, {newEuler.y:F1}, {newEuler.z:F1})");
+                $"Orbited {direction} by {angleDeg:F1} deg. Rotation: ({oldEuler.x:F1}, {oldEuler.y:F1}, {oldEuler.z:F1}) -> ({newEuler.x:F1}, {newEuler.y:F1}, {newEuler.z:F1})");
         }
 
         /// <summary>
@@ -656,7 +1078,7 @@ namespace LLMAgent
             if (string.IsNullOrEmpty(gameObjectName))
                 return BuildErrorJson("GameObject name cannot be empty.");
 
-            var go = GameObject.Find(gameObjectName);
+            var go = ResolveSceneViewTarget(gameObjectName);
             if (go == null)
                 return BuildErrorJson($"GameObject '{gameObjectName}' not found.");
 
@@ -673,6 +1095,62 @@ namespace LLMAgent
             Debug.Log($"[ScreenCaptureBridge] Focused Scene view on '{go.name}': pivot=({p.x:F2},{p.y:F2},{p.z:F2}), size={s:F2}");
             var ic = System.Globalization.CultureInfo.InvariantCulture;
             return "{\"success\":true,\"focused\":\"" + EscapeJson(go.name) + "\",\"pivot\":{\"x\":" + p.x.ToString("F3", ic) + ",\"y\":" + p.y.ToString("F3", ic) + ",\"z\":" + p.z.ToString("F3", ic) + "},\"size\":" + s.ToString("F3", ic) + "}";
+        }
+
+        private static GameObject ResolveSceneViewTarget(string gameObjectName)
+        {
+            GameObject go = GameObject.Find(gameObjectName);
+            if (go != null)
+            {
+                return go;
+            }
+
+            var activeScene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            if (activeScene.IsValid() && activeScene.isLoaded)
+            {
+                foreach (var root in activeScene.GetRootGameObjects())
+                {
+                    go = FindInHierarchy(root.transform, gameObjectName);
+                    if (go != null)
+                    {
+                        return go;
+                    }
+                }
+            }
+
+#if UNITY_EDITOR
+            var prefabStage = PrefabStageUtility.GetCurrentPrefabStage();
+            if (prefabStage != null && prefabStage.prefabContentsRoot != null)
+            {
+                return FindInHierarchy(prefabStage.prefabContentsRoot.transform, gameObjectName);
+            }
+#endif
+
+            return null;
+        }
+
+        private static GameObject FindInHierarchy(Transform root, string gameObjectName)
+        {
+            if (root == null)
+            {
+                return null;
+            }
+
+            if (string.Equals(root.name, gameObjectName, StringComparison.Ordinal))
+            {
+                return root.gameObject;
+            }
+
+            for (int i = 0; i < root.childCount; i++)
+            {
+                var found = FindInHierarchy(root.GetChild(i), gameObjectName);
+                if (found != null)
+                {
+                    return found;
+                }
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -777,6 +1255,91 @@ namespace LLMAgent
             return BuildSuccessJson(base64, finalWidth, finalHeight);
         }
 
+        private static string FinalizeMcpCapture(Texture2D sourceTex, int maxResolution, bool includeImage, string filePrefix)
+        {
+            int outputWidth = sourceTex.width;
+            int outputHeight = sourceTex.height;
+            Texture2D outputTex = sourceTex;
+
+            try
+            {
+                if (includeImage)
+                {
+                    int targetMax = maxResolution > 0 ? maxResolution : DefaultMcpMaxResolution;
+                    if (sourceTex.width > targetMax || sourceTex.height > targetMax)
+                    {
+                        float scale = Mathf.Min((float)targetMax / sourceTex.width, (float)targetMax / sourceTex.height);
+                        outputWidth = Mathf.Max(1, Mathf.RoundToInt(sourceTex.width * scale));
+                        outputHeight = Mathf.Max(1, Mathf.RoundToInt(sourceTex.height * scale));
+                        outputTex = ResizeTexture(sourceTex, outputWidth, outputHeight);
+                    }
+
+                    byte[] pngBytes = outputTex.EncodeToPNG();
+                    string base64 = Convert.ToBase64String(pngBytes);
+                    Debug.Log($"[ScreenCaptureBridge] MCP screenshot prepared: {outputWidth}x{outputHeight}, {pngBytes.Length} bytes");
+                    return BuildMcpSuccessJson(base64, outputWidth, outputHeight, null);
+                }
+
+                byte[] fullPngBytes = sourceTex.EncodeToPNG();
+                string fullPath = SaveMcpScreenshotToTemp(fullPngBytes, filePrefix);
+                Debug.Log($"[ScreenCaptureBridge] MCP screenshot saved to: {fullPath} ({sourceTex.width}x{sourceTex.height})");
+                return BuildMcpSuccessJson(null, sourceTex.width, sourceTex.height, fullPath);
+            }
+            finally
+            {
+                if (outputTex != sourceTex)
+                {
+                    UnityEngine.Object.DestroyImmediate(outputTex);
+                }
+
+                UnityEngine.Object.DestroyImmediate(sourceTex);
+            }
+        }
+
+        private static string ReadMcpScreenshotFromFile(string fullPath, int maxResolution, bool includeImage)
+        {
+            byte[] pngBytes = File.ReadAllBytes(fullPath);
+            var sourceTex = new Texture2D(2, 2, TextureFormat.RGB24, false);
+            if (!sourceTex.LoadImage(pngBytes))
+            {
+                UnityEngine.Object.DestroyImmediate(sourceTex);
+                return BuildErrorJson($"Failed to load screenshot file '{fullPath}'.");
+            }
+
+            int sourceWidth = sourceTex.width;
+            int sourceHeight = sourceTex.height;
+            Texture2D outputTex = sourceTex;
+
+            try
+            {
+                if (includeImage)
+                {
+                    int targetMax = maxResolution > 0 ? maxResolution : DefaultMcpMaxResolution;
+                    if (sourceWidth > targetMax || sourceHeight > targetMax)
+                    {
+                        float scale = Mathf.Min((float)targetMax / sourceWidth, (float)targetMax / sourceHeight);
+                        int outputWidth = Mathf.Max(1, Mathf.RoundToInt(sourceWidth * scale));
+                        int outputHeight = Mathf.Max(1, Mathf.RoundToInt(sourceHeight * scale));
+                        outputTex = ResizeTexture(sourceTex, outputWidth, outputHeight);
+                        byte[] scaledBytes = outputTex.EncodeToPNG();
+                        return BuildMcpSuccessJson(Convert.ToBase64String(scaledBytes), outputWidth, outputHeight, fullPath);
+                    }
+
+                    return BuildMcpSuccessJson(Convert.ToBase64String(pngBytes), sourceWidth, sourceHeight, fullPath);
+                }
+
+                return BuildMcpSuccessJson(null, sourceWidth, sourceHeight, fullPath);
+            }
+            finally
+            {
+                if (outputTex != sourceTex)
+                {
+                    UnityEngine.Object.DestroyImmediate(outputTex);
+                }
+                UnityEngine.Object.DestroyImmediate(sourceTex);
+            }
+        }
+
         /// <summary>
         /// Resize a texture using GPU bilinear filtering via RenderTexture + Blit.
         /// </summary>
@@ -803,6 +1366,33 @@ namespace LLMAgent
         private static string BuildSuccessJson(string base64, int width, int height)
         {
             return $"{{\"success\":true,\"width\":{width},\"height\":{height},\"base64\":\"{base64}\"}}";
+        }
+
+        private static string BuildMcpSuccessJson(string base64, int width, int height, string path)
+        {
+            string pathJson = string.IsNullOrEmpty(path) ? "null" : $"\"{EscapeJson(path)}\"";
+            if (string.IsNullOrEmpty(base64))
+            {
+                return $"{{\"success\":true,\"width\":{width},\"height\":{height},\"path\":{pathJson}}}";
+            }
+
+            return $"{{\"success\":true,\"width\":{width},\"height\":{height},\"path\":{pathJson},\"base64\":\"{base64}\"}}";
+        }
+
+        private static string SaveMcpScreenshotToTemp(byte[] pngBytes, string filePrefix)
+        {
+            string fullPath = SaveMcpScreenshotToTempPath(filePrefix);
+            File.WriteAllBytes(fullPath, pngBytes);
+            return fullPath;
+        }
+
+        private static string SaveMcpScreenshotToTempPath(string filePrefix)
+        {
+            string safePrefix = string.IsNullOrWhiteSpace(filePrefix) ? "screenshot" : filePrefix;
+            string folder = Path.GetFullPath(Path.Combine(Application.dataPath, "..", "Temp", "PuertsMcpScreenshots"));
+            Directory.CreateDirectory(folder);
+            string fileName = $"{safePrefix}-{DateTime.Now:yyyyMMdd-HHmmss-fff}.png";
+            return Path.Combine(folder, fileName);
         }
 
         private static string BuildErrorJson(string errorMessage)

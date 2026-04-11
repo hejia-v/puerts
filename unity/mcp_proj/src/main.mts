@@ -29,6 +29,17 @@ interface SessionEntry {
     transport: CSharpBridgeTransport;
 }
 
+type ScreenshotView = 'game' | 'scene';
+
+interface CaptureBridgeResult {
+    success: boolean;
+    base64?: string;
+    width?: number;
+    height?: number;
+    path?: string | null;
+    error?: string;
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -41,6 +52,27 @@ let activeBridge: CSharpHttpBridge | null = null;
 
 /** Whether the server has been initialized (builtins loaded, bridge set). */
 let serverReady = false;
+
+async function captureScreenshotViaBridge(
+    view: ScreenshotView,
+    maxResolution: number,
+    includeImage: boolean,
+): Promise<CaptureBridgeResult> {
+    const resultJson = await new Promise<string>((resolve, reject) => {
+        try {
+            const callback = (json: string) => resolve(json);
+            if (view === 'scene') {
+                CS.LLMAgent.ScreenCaptureBridge.CaptureSceneViewForMcpAsync(maxResolution, includeImage, callback);
+            } else {
+                CS.LLMAgent.ScreenCaptureBridge.CaptureScreenForMcpAsync(maxResolution, includeImage, callback);
+            }
+        } catch (error) {
+            reject(error);
+        }
+    });
+
+    return JSON.parse(resultJson) as CaptureBridgeResult;
+}
 
 // ---------------------------------------------------------------------------
 // MCP Server setup
@@ -155,6 +187,89 @@ function createMcpServer(): InstanceType<typeof McpServer> {
             }
 
             return { content };
+        }
+    );
+
+    server.tool(
+        'captureScreenshot',
+        'Capture a Unity screenshot as a first-class MCP tool. ' +
+        'This tool directly uses the native C# ScreenCaptureBridge path instead of requiring evalJsCode or builtin imports. ' +
+        'Use `captureSource: "game_view"` for Game view verification and `captureSource: "scene_view"` for Scene view verification.\n\n' +
+        'The capture keeps the current Unity view aspect ratio. `maxResolution` only limits the longest edge of the inline image; ' +
+        'it does not invent a new width/height ratio. If `includeImage` is false, the tool saves the screenshot to a temp file and returns its path instead of injecting image bytes into context.',
+        {
+            captureSource: z.enum(['game_view', 'scene_view']).optional().default('game_view').describe(
+                'Which Unity view to capture. Use `game_view` for Game view and `scene_view` for Scene view.'
+            ),
+            includeImage: z.boolean().optional().default(false).describe(
+                'Whether to inline the screenshot image into the MCP response. Set false to save a file and only return metadata plus path.'
+            ),
+            maxResolution: z.number().int().min(64).max(4096).optional().default(640).describe(
+                'Maximum longest edge for the inline image. The tool preserves the current Game or Scene view aspect ratio.'
+            ),
+        },
+        async ({ captureSource, includeImage, maxResolution }) => {
+            try {
+                const view: ScreenshotView = captureSource === 'scene_view' ? 'scene' : 'game';
+                const result = await captureScreenshotViaBridge(view, maxResolution, includeImage);
+                if (!result.success || !result.base64) {
+                    if (!result.success) {
+                        return {
+                            content: [{
+                                type: 'text' as const,
+                                text: `Screenshot capture failed: ${result.error || 'Unknown error'}`,
+                            }],
+                            isError: true,
+                        };
+                    }
+
+                    const metadata = {
+                        success: true,
+                        captureSource,
+                        includeImage,
+                        maxResolution,
+                        width: result.width ?? null,
+                        height: result.height ?? null,
+                        path: result.path ?? null,
+                    };
+
+                    return {
+                        content: [{
+                            type: 'text' as const,
+                            text: JSON.stringify(metadata, null, 2),
+                        }],
+                    };
+                }
+
+                const metadata = {
+                    success: true,
+                    captureSource,
+                    includeImage,
+                    maxResolution,
+                    width: result.width ?? null,
+                    height: result.height ?? null,
+                    path: result.path ?? null,
+                };
+
+                return {
+                    content: [
+                        { type: 'text' as const, text: JSON.stringify(metadata, null, 2) },
+                        {
+                            type: 'image' as const,
+                            data: result.base64,
+                            mimeType: 'image/png' as const,
+                        },
+                    ],
+                };
+            } catch (error: any) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: `Screenshot capture failed: ${error?.message || String(error)}`,
+                    }],
+                    isError: true,
+                };
+            }
         }
     );
 

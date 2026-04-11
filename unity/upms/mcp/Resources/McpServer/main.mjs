@@ -14449,6 +14449,22 @@ __name(executeCode, "executeCode");
 var sessions = /* @__PURE__ */ new Map();
 var activeBridge = null;
 var serverReady = false;
+async function captureScreenshotViaBridge(view, maxResolution, includeImage) {
+  const resultJson = await new Promise((resolve, reject) => {
+    try {
+      const callback = /* @__PURE__ */ __name((json) => resolve(json), "callback");
+      if (view === "scene") {
+        CS.LLMAgent.ScreenCaptureBridge.CaptureSceneViewForMcpAsync(maxResolution, includeImage, callback);
+      } else {
+        CS.LLMAgent.ScreenCaptureBridge.CaptureScreenForMcpAsync(maxResolution, includeImage, callback);
+      }
+    } catch (error) {
+      reject(error);
+    }
+  });
+  return JSON.parse(resultJson);
+}
+__name(captureScreenshotViaBridge, "captureScreenshotViaBridge");
 function createMcpServer() {
   const server = new McpServer({
     name: "puerts-unity-editor-assistant",
@@ -14517,6 +14533,80 @@ function createMcpServer() {
         });
       }
       return { content };
+    }
+  );
+  server.tool(
+    "captureScreenshot",
+    'Capture a Unity screenshot as a first-class MCP tool. This tool directly uses the native C# ScreenCaptureBridge path instead of requiring evalJsCode or builtin imports. Use `captureSource: "game_view"` for Game view verification and `captureSource: "scene_view"` for Scene view verification.\n\nThe capture keeps the current Unity view aspect ratio. `maxResolution` only limits the longest edge of the inline image; it does not invent a new width/height ratio. If `includeImage` is false, the tool saves the screenshot to a temp file and returns its path instead of injecting image bytes into context.',
+    {
+      captureSource: external_exports.enum(["game_view", "scene_view"]).optional().default("game_view").describe(
+        "Which Unity view to capture. Use `game_view` for Game view and `scene_view` for Scene view."
+      ),
+      includeImage: external_exports.boolean().optional().default(false).describe(
+        "Whether to inline the screenshot image into the MCP response. Set false to save a file and only return metadata plus path."
+      ),
+      maxResolution: external_exports.number().int().min(64).max(4096).optional().default(640).describe(
+        "Maximum longest edge for the inline image. The tool preserves the current Game or Scene view aspect ratio."
+      )
+    },
+    async ({ captureSource, includeImage, maxResolution }) => {
+      try {
+        const view = captureSource === "scene_view" ? "scene" : "game";
+        const result = await captureScreenshotViaBridge(view, maxResolution, includeImage);
+        if (!result.success || !result.base64) {
+          if (!result.success) {
+            return {
+              content: [{
+                type: "text",
+                text: `Screenshot capture failed: ${result.error || "Unknown error"}`
+              }],
+              isError: true
+            };
+          }
+          const metadata2 = {
+            success: true,
+            captureSource,
+            includeImage,
+            maxResolution,
+            width: result.width ?? null,
+            height: result.height ?? null,
+            path: result.path ?? null
+          };
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify(metadata2, null, 2)
+            }]
+          };
+        }
+        const metadata = {
+          success: true,
+          captureSource,
+          includeImage,
+          maxResolution,
+          width: result.width ?? null,
+          height: result.height ?? null,
+          path: result.path ?? null
+        };
+        return {
+          content: [
+            { type: "text", text: JSON.stringify(metadata, null, 2) },
+            {
+              type: "image",
+              data: result.base64,
+              mimeType: "image/png"
+            }
+          ]
+        };
+      } catch (error) {
+        return {
+          content: [{
+            type: "text",
+            text: `Screenshot capture failed: ${error?.message || String(error)}`
+          }],
+          isError: true
+        };
+      }
     }
   );
   return server;
