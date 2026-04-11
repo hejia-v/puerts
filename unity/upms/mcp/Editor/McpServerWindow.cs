@@ -1,4 +1,5 @@
 using System;
+using System.Net.Sockets;
 using UnityEditor;
 using UnityEngine;
 using PuertsMcp;
@@ -15,6 +16,7 @@ namespace PuertsMcp.Editor
         // Global singleton state — survives window close and play mode changes
         private static McpScriptManager s_scriptManager;
         private static bool s_isStarting;
+        private static bool s_autoRestartQueued;
         private static string s_statusMessage = "Stopped";
         private static int s_activePort;
 
@@ -47,14 +49,43 @@ namespace PuertsMcp.Editor
         private static void OnDomainLoaded()
         {
             // Register for the NEXT domain reload — shut down cleanly before it happens
+            AssemblyReloadEvents.beforeAssemblyReload -= OnBeforeAssemblyReload;
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
 
             // Check if we were running before the reload and auto-restart
             if (SessionState.GetBool(SessionKeyWasRunning, false))
             {
-                // Delay slightly to ensure all editor systems are ready
-                EditorApplication.delayCall += AutoRestartAfterReload;
+                QueueAutoRestart();
             }
+        }
+
+        public static void EnsureServerRunningFromAutoStart()
+        {
+            SessionState.SetBool(SessionKeyWasRunning, true);
+            QueueAutoRestart();
+        }
+
+        private static void QueueAutoRestart()
+        {
+            if (s_autoRestartQueued)
+            {
+                return;
+            }
+
+            s_autoRestartQueued = true;
+            EditorApplication.delayCall += RunQueuedAutoRestart;
+        }
+
+        private static void RunQueuedAutoRestart()
+        {
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+            {
+                EditorApplication.delayCall += RunQueuedAutoRestart;
+                return;
+            }
+
+            s_autoRestartQueued = false;
+            AutoRestartAfterReload();
         }
 
         /// <summary>
@@ -79,6 +110,7 @@ namespace PuertsMcp.Editor
                 s_scriptManager = null;
             }
 
+            s_autoRestartQueued = false;
             s_isStarting = false;
             s_statusMessage = "Stopped (domain reload)";
 
@@ -95,6 +127,10 @@ namespace PuertsMcp.Editor
             if (IsRunning || s_isStarting) return;
 
             int port = EditorPrefs.GetInt(PrefKeyPort, 3100);
+            if (TryHandlePortConflict(port, "restart"))
+            {
+                return;
+            }
 
             Debug.Log($"[McpServerWindow] Auto-restarting MCP Server after domain reload (port {port})...");
 
@@ -125,6 +161,40 @@ namespace PuertsMcp.Editor
                 var window = GetWindowIfOpen();
                 if (window != null) window.Repaint();
             });
+        }
+
+        private static bool IsPortListening(int port)
+        {
+            try
+            {
+                using var client = new TcpClient();
+                return client.ConnectAsync("127.0.0.1", port).Wait(150);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryHandlePortConflict(int port, string actionName)
+        {
+            if (!IsPortListening(port))
+            {
+                return false;
+            }
+
+            s_isStarting = false;
+            s_statusMessage = $"Port {port} is already in use.";
+            SessionState.SetBool(SessionKeyWasRunning, false);
+            Debug.LogWarning($"[McpServerWindow] Skipping MCP Server {actionName}: port {port} is already in use.");
+
+            var window = GetWindowIfOpen();
+            if (window != null)
+            {
+                window.Repaint();
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -227,6 +297,11 @@ namespace PuertsMcp.Editor
             if (IsRunning || s_isStarting) return;
 
             SaveSettings();
+            if (TryHandlePortConflict(port, "start"))
+            {
+                return;
+            }
+
             s_isStarting = true;
             s_statusMessage = "Starting...";
             s_activePort = port;

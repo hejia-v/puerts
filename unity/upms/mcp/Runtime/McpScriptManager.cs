@@ -83,6 +83,8 @@ namespace PuertsMcp
                 {
                     lastError = "[McpScriptManager] Failed to get 'onInitialize' export from module.";
                     Debug.LogError(lastError);
+                    Dispose();
+                    onReady?.Invoke(false);
                     return;
                 }
 
@@ -154,6 +156,7 @@ namespace PuertsMcp
                         isInitialized = false;
                         lastError = $"[McpScriptManager] Server failed to start: {errorMsg}";
                         Debug.LogError(lastError);
+                        Dispose();
                     }
                     onReady?.Invoke(success);
                 });
@@ -163,6 +166,8 @@ namespace PuertsMcp
                 lastError = $"[McpScriptManager] Failed to initialize: {ex.Message} {ex.StackTrace}";
                 Debug.LogError(lastError);
                 isInitialized = false;
+                Dispose();
+                onReady?.Invoke(false);
             }
         }
 
