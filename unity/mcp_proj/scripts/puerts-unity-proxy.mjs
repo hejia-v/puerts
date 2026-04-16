@@ -233,6 +233,54 @@ const server = new McpServer({
 });
 
 server.tool(
+    'searchBuiltins',
+    'Forward `searchBuiltins` to the Unity Editor PuerTS MCP endpoint. ' +
+    'This proxy keeps a local stdio MCP session for Codex and automatically recovers from Unity domain reloads.',
+    {
+        query: z.string().optional().default('').describe(
+            'Search text. Match against builtin name, module name, signature, and short summary.'
+        ),
+        tags: z.array(z.string()).optional().describe(
+            'Optional keyword filters. These are treated as lightweight tags/keywords.'
+        ),
+        limit: z.number().int().min(1).max(50).optional().default(8).describe(
+            'Maximum number of search results to return. Default is 8.'
+        ),
+    },
+    async ({ query, tags, limit }) => {
+        return await upstream.callTool('searchBuiltins', {
+            query,
+            tags,
+            limit,
+        });
+    }
+);
+
+server.tool(
+    'runBuiltin',
+    'Forward `runBuiltin` to the Unity Editor PuerTS MCP endpoint. ' +
+    'This proxy keeps a local stdio MCP session for Codex and automatically recovers from Unity domain reloads.',
+    {
+        name: z.string().describe(
+            'Exact builtin name, usually in `moduleName.exportName` form.'
+        ),
+        args: z.any().optional().describe(
+            'Optional builtin arguments. Use an array for positional arguments.'
+        ),
+        timeout: z.number().optional().default(30).describe(
+            'Execution timeout in seconds. Default is 30s.'
+        ),
+    },
+    async ({ name, args, timeout }) => {
+        return await upstream.callTool('runBuiltin', {
+            name,
+            args,
+            timeout,
+        });
+    }
+);
+
+server.tool(
     'evalJsCode',
     'Forward `evalJsCode` to the Unity Editor PuerTS MCP endpoint. ' +
     'This proxy keeps a local stdio MCP session for Codex and automatically waits for Unity domain reload recovery, ' +

@@ -6,10 +6,96 @@
  */
 import { tool } from 'ai';
 import { z } from 'zod';
-import { executeCode, initBuiltins, builtinSummariesText } from '../../../ai_shared_src/eval-core.mjs';
+import {
+    executeCode,
+    initBuiltins,
+    builtinSummariesText,
+    searchBuiltins,
+    runBuiltin,
+} from '../../../ai_shared_src/eval-core.mjs';
 
 // Re-export initBuiltins so that main.mts can continue importing it from here.
 export { initBuiltins, builtinSummariesText };
+
+function toModelFriendlyOutput(output: any) {
+    if (output && typeof output === 'object' && typeof output.success === 'boolean') {
+        if (!output.success) {
+            return {
+                type: 'text' as const,
+                value: `Error: ${output.error}${output.stack ? '\nStack: ' + output.stack : ''}`,
+            };
+        }
+
+        const result = output.result;
+
+        // Recursively collect all __image markers from an object and
+        // delete them from the source so they don't appear in the text.
+        const images: Array<{ base64: string; mediaType: string }> = [];
+        function collectAndStrip(obj: any, visited: Set<any>) {
+            if (!obj || typeof obj !== 'object') return;
+            if (visited.has(obj)) return;
+            visited.add(obj);
+            if (obj.__image && obj.__image.base64) {
+                images.push({
+                    base64: obj.__image.base64,
+                    mediaType: obj.__image.mediaType || 'image/png',
+                });
+                delete obj.__image;
+            }
+            for (const key of Object.keys(obj)) {
+                collectAndStrip(obj[key], visited);
+            }
+        }
+
+        let textContent: string;
+        if (result === undefined) {
+            textContent = '(no return value)';
+        } else if (result === null) {
+            textContent = 'null';
+        } else if (typeof result === 'object') {
+            collectAndStrip(result, new Set());
+            try { textContent = JSON.stringify(result, null, 2); } catch (_) { textContent = String(result); }
+        } else {
+            textContent = String(result);
+        }
+
+        if (images.length > 0) {
+            console.log(`[Eval] toModelOutput: including ${images.length} image(s)`);
+            return {
+                type: 'content' as const,
+                value: [
+                    { type: 'text' as const, text: textContent },
+                    ...images.map(img => ({
+                        type: 'file-data' as const,
+                        data: img.base64,
+                        mediaType: img.mediaType,
+                    })),
+                ],
+            };
+        }
+
+        return {
+            type: 'text' as const,
+            value: textContent,
+        };
+    }
+
+    let textContent: string;
+    if (output === undefined) {
+        textContent = '(no return value)';
+    } else if (output === null) {
+        textContent = 'null';
+    } else if (typeof output === 'object') {
+        try { textContent = JSON.stringify(output, null, 2); } catch (_) { textContent = String(output); }
+    } else {
+        textContent = String(output);
+    }
+
+    return {
+        type: 'text' as const,
+        value: textContent,
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Tool factory
@@ -21,6 +107,76 @@ export { initBuiltins, builtinSummariesText };
 export function createEvalTools() {
     return {
         /**
+         * Discover builtin helper calls without expanding every helper into its own tool.
+         */
+        searchBuiltins: tool({
+            description:
+                'Search the compact builtin helper registry. ' +
+                'Use this when you need to discover the right preloaded helper first. ' +
+                'The result returns exact builtin names you can pass to `runBuiltin`.',
+            inputSchema: z.object({
+                query: z
+                    .string()
+                    .optional()
+                    .default('')
+                    .describe('Search text. Match against builtin name, module name, signature, and short summary.'),
+                tags: z
+                    .array(z.string())
+                    .optional()
+                    .describe('Optional keyword filters. These are treated as lightweight tags/keywords.'),
+                limit: z
+                    .number()
+                    .int()
+                    .min(1)
+                    .max(50)
+                    .optional()
+                    .default(8)
+                    .describe('Maximum number of search results to return. Default is 8.'),
+            }),
+            execute: async ({ query, tags, limit }) => {
+                return {
+                    results: searchBuiltins(query ?? '', tags, limit ?? 8),
+                };
+            },
+            toModelOutput({ output }: { output: any }) {
+                return toModelFriendlyOutput(output);
+            },
+        }),
+        /**
+         * Run a known builtin by exact name.
+         */
+        runBuiltin: tool({
+            description:
+                'Run a preloaded builtin helper by exact name, usually after `searchBuiltins`. ' +
+                'Use this for common Unity/editor helper operations instead of writing custom `evalJsCode`. ' +
+                'Pass positional parameters as an array in `args`, for example `["forward", 1]`; ' +
+                'pass a single object or primitive directly when the builtin takes one argument.' +
+                builtinSummariesText,
+            inputSchema: z.object({
+                name: z
+                    .string()
+                    .describe(
+                        'Exact builtin name, usually in `moduleName.exportName` form, ' +
+                        'for example `unity-log.getUnityLogSummary` or `scene-view.getSceneViewState`.'
+                    ),
+                args: z
+                    .any()
+                    .optional()
+                    .describe('Optional builtin arguments. Use an array for positional arguments.'),
+                timeout: z
+                    .number()
+                    .optional()
+                    .default(30)
+                    .describe('Execution timeout in seconds. Default is 30s.'),
+            }),
+            execute: async ({ name, args, timeout }) => {
+                return await runBuiltin(name, args, timeout ?? 30);
+            },
+            toModelOutput({ output }: { output: any }) {
+                return toModelFriendlyOutput(output);
+            },
+        }),
+        /**
          * Evaluate JavaScript code in the PuerTS runtime environment.
          */
         evalJsCode: tool({
@@ -30,9 +186,9 @@ export function createEvalTools() {
                 'variables, functions, and state defined in previous calls persist and can be referenced in later calls.\n\n' +
                 'The code runs inside Unity via PuerTS with full access to the `CS` and `puer` globals ' +
                 '(see PuerTS interop rules and runtime environment notes in the system prompt).\n\n' +
-                'Use this tool when you need to inspect or modify Unity scene objects, ' +
-                'create/destroy GameObjects or Components, query hierarchies, ' +
-                'execute Unity API calls dynamically, or test code snippets in the live environment.\n\n' +
+                'Prefer `runBuiltin` for known helper operations and `searchBuiltins` to discover them. ' +
+                'Use `evalJsCode` when you need custom composition, arbitrary Unity API access, ' +
+                'or logic that is not covered by a builtin.\n\n' +
                 '**Code format**: Your code MUST be an async function declaration named `execute`, for example:\n' +
                 '```\nasync function execute() {\n    // your logic here\n    return someValue;\n}\n```\n' +
                 'Use `return <value>` inside the function to pass a result back — the returned value will appear in the `result` field of the response. ' +
@@ -64,72 +220,8 @@ export function createEvalTools() {
             execute: async ({ code, timeout }) => {
                 return await executeCode(code, timeout ?? 30);
             },
-            // Convert eval output to model-friendly content.
-            // When the executed code returns an object with an __image marker
-            // (e.g. from the screenshot builtin), the image is included as
-            // file-data so that handlePrepareStep can extract it and inject
-            // it as a user-message image part for the LLM to see.
             toModelOutput({ output }: { output: any }) {
-                if (!output.success) {
-                    return {
-                        type: 'text' as const,
-                        value: `Error: ${output.error}${output.stack ? '\nStack: ' + output.stack : ''}`,
-                    };
-                }
-
-                const result = output.result;
-
-                // Recursively collect all __image markers from an object and
-                // delete them from the source so they don't appear in the text.
-                const images: Array<{ base64: string; mediaType: string }> = [];
-                function collectAndStrip(obj: any, visited: Set<any>) {
-                    if (!obj || typeof obj !== 'object') return;
-                    if (visited.has(obj)) return;
-                    visited.add(obj);
-                    if (obj.__image && obj.__image.base64) {
-                        images.push({
-                            base64: obj.__image.base64,
-                            mediaType: obj.__image.mediaType || 'image/png',
-                        });
-                        delete obj.__image;
-                    }
-                    for (const key of Object.keys(obj)) {
-                        collectAndStrip(obj[key], visited);
-                    }
-                }
-
-                // Serialize the result to text, extracting images from objects.
-                let textContent: string;
-                if (result === undefined) {
-                    textContent = '(no return value)';
-                } else if (result === null) {
-                    textContent = 'null';
-                } else if (typeof result === 'object') {
-                    collectAndStrip(result, new Set());
-                    try { textContent = JSON.stringify(result, null, 2); } catch (_) { textContent = String(result); }
-                } else {
-                    textContent = String(result);
-                }
-
-                if (images.length > 0) {
-                    console.log(`[Eval] toModelOutput: including ${images.length} image(s)`);
-                    return {
-                        type: 'content' as const,
-                        value: [
-                            { type: 'text' as const, text: textContent },
-                            ...images.map(img => ({
-                                type: 'file-data' as const,
-                                data: img.base64,
-                                mediaType: img.mediaType,
-                            })),
-                        ],
-                    };
-                }
-
-                return {
-                    type: 'text' as const,
-                    value: textContent,
-                };
+                return toModelFriendlyOutput(output);
             },
         }),
     };

@@ -65,6 +65,14 @@ The placeholder prefix is unique per session:
 
 If the \`loadSkill\` tool is available, you **MUST** call it to load the relevant skill **before** performing any task that falls within that skill's domain. For example, if a task involves calling C# APIs from JS via PuerTS, you must first load the corresponding skill to get the correct interop rules. **Never assume you know the correct approach — always load the skill first.**
 
+## Builtin Routing
+
+If \`runBuiltin\` and \`searchBuiltins\` are available, prefer them over \`evalJsCode\` for common helper actions.
+
+- Use \`runBuiltin\` when you already know the exact builtin name.
+- Use \`searchBuiltins\` only when you need to discover the right builtin first.
+- Use \`evalJsCode\` as the fallback for custom logic, arbitrary composition, or APIs that are not covered by a builtin.
+
 ## evalJsCode Runtime Environment
 
 The evalJsCode tool runs in a **pure V8 engine** — there is NO \`window\`, \`document\`, \`DOM\`, or any browser/Node.js API. However, \`setTimeout\`, \`setInterval\`, \`clearTimeout\`, and \`clearInterval\` are available (provided by PuerTS). To persist state across calls, use \`globalThis.myVar = ...\` or top-level \`var\` declarations.

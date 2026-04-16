@@ -130,7 +130,7 @@ The Editor Assistant comes in two versions:
 **What makes Puerts MCP different from other Unity MCP solutions?**
 
 - **No separate process** — the MCP server runs directly inside the Unity process, no extra services to launch
-- **Single tool, on-demand builtins** — instead of registering dozens of tools upfront, it exposes only one tool; builtin modules are loaded on demand, saving context tokens while remaining equally powerful
+- **Small tool surface, on-demand builtins** — keep the top-level interface compact (`searchBuiltins`, `runBuiltin`, and `evalJsCode` fallback) instead of registering dozens of tools upfront; builtin modules are discovered progressively and loaded on demand, saving context tokens while remaining equally powerful
 - **Extensible via builtins & skills** — add new capabilities by dropping files into the resource directory, no code changes needed
 
 ### Puerts.Agent Framework

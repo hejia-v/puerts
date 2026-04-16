@@ -18,7 +18,13 @@ import { JSONRPCMessageSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
 
 import { setResourceRoot } from '../../ai_shared_src/resource-root.mjs';
-import { initBuiltins, executeCode, builtinSummariesText } from '../../ai_shared_src/eval-core.mjs';
+import {
+    initBuiltins,
+    executeCode,
+    builtinSummariesText,
+    searchBuiltins,
+    runBuiltin,
+} from '../../ai_shared_src/eval-core.mjs';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -74,6 +80,57 @@ async function captureScreenshotViaBridge(
     return JSON.parse(resultJson) as CaptureBridgeResult;
 }
 
+function buildErrorContent(error: string, stack?: string) {
+    return {
+        content: [{ type: 'text' as const, text: `Error: ${error}${stack ? '\nStack: ' + stack : ''}` }],
+        isError: true,
+    };
+}
+
+function buildSuccessContent(raw: any) {
+    const images: Array<{ base64: string; mimeType: string }> = [];
+    function collectAndStrip(obj: any, visited: Set<any>) {
+        if (!obj || typeof obj !== 'object') return;
+        if (visited.has(obj)) return;
+        visited.add(obj);
+        if (obj.__image && obj.__image.base64) {
+            images.push({
+                base64: obj.__image.base64,
+                mimeType: obj.__image.mediaType || 'image/png',
+            });
+            delete obj.__image;
+        }
+        for (const key of Object.keys(obj)) {
+            collectAndStrip(obj[key], visited);
+        }
+    }
+
+    let textContent: string;
+    if (raw === undefined) {
+        textContent = '(no return value)';
+    } else if (raw === null) {
+        textContent = 'null';
+    } else if (typeof raw === 'object') {
+        collectAndStrip(raw, new Set());
+        try { textContent = JSON.stringify(raw, null, 2); } catch (_) { textContent = String(raw); }
+    } else {
+        textContent = String(raw);
+    }
+
+    const content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [];
+    content.push({ type: 'text' as const, text: textContent });
+
+    for (const img of images) {
+        content.push({
+            type: 'image' as const,
+            data: img.base64,
+            mimeType: img.mimeType,
+        });
+    }
+
+    return { content };
+}
+
 // ---------------------------------------------------------------------------
 // MCP Server setup
 // ---------------------------------------------------------------------------
@@ -83,6 +140,57 @@ function createMcpServer(): InstanceType<typeof McpServer> {
         name: 'puerts-unity-editor-assistant',
         version: '1.0.0',
     });
+
+    server.tool(
+        'searchBuiltins',
+        'Search the compact builtin helper registry. ' +
+        'Use this when you need to discover the right preloaded helper first. ' +
+        'The response returns exact builtin names that you can pass to `runBuiltin`.',
+        {
+            query: z.string().optional().default('').describe(
+                'Search text. Match against builtin name, module name, signature, and short summary.'
+            ),
+            tags: z.array(z.string()).optional().describe(
+                'Optional keyword filters. These are treated as lightweight tags/keywords.'
+            ),
+            limit: z.number().int().min(1).max(50).optional().default(8).describe(
+                'Maximum number of search results to return. Default is 8.'
+            ),
+        },
+        async ({ query, tags, limit }) => {
+            return buildSuccessContent({
+                results: searchBuiltins(query ?? '', tags, limit ?? 8),
+            });
+        }
+    );
+
+    server.tool(
+        'runBuiltin',
+        'Run a preloaded builtin helper by exact name, usually after `searchBuiltins`. ' +
+        'Use this for common Unity/editor helper operations instead of writing custom `evalJsCode`. ' +
+        'Pass positional parameters as an array in `args`, for example `["forward", 1]`; ' +
+        'pass a single object or primitive directly when the builtin takes one argument.' +
+        builtinSummariesText,
+        {
+            name: z.string().describe(
+                'Exact builtin name, usually in `moduleName.exportName` form, ' +
+                'for example `unity-log.getUnityLogSummary` or `scene-view.getSceneViewState`.'
+            ),
+            args: z.any().optional().describe(
+                'Optional builtin arguments. Use an array for positional arguments.'
+            ),
+            timeout: z.number().optional().default(30).describe(
+                'Execution timeout in seconds. Default is 30s.'
+            ),
+        },
+        async ({ name, args, timeout }) => {
+            const result = await runBuiltin(name, args, timeout ?? 30);
+            if (!result.success) {
+                return buildErrorContent(result.error || 'Unknown error', result.stack);
+            }
+            return buildSuccessContent(result.result);
+        }
+    );
 
     // Register the evalJsCode tool
     server.tool(
@@ -95,10 +203,9 @@ function createMcpServer(): InstanceType<typeof McpServer> {
         'including `CS.UnityEditor.*` APIs (e.g. `CS.UnityEditor.AssetDatabase`, `CS.UnityEditor.Selection`, ' +
         '`CS.UnityEditor.EditorApplication`, `CS.UnityEditor.SceneManagement`, etc.) ' +
         'as well as all `CS.UnityEngine.*` runtime APIs.\n\n' +
-        'Use this tool when you need to inspect or modify Unity scene objects, ' +
-        'create/destroy GameObjects or Components, query hierarchies, ' +
-        'manipulate assets, modify Editor settings, automate Editor workflows, ' +
-        'execute Unity API calls dynamically, or test code snippets in the live Editor environment.\n\n' +
+        'Prefer `runBuiltin` for known helper operations and `searchBuiltins` to discover them. ' +
+        'Use `evalJsCode` when you need custom composition, arbitrary Unity API access, ' +
+        'or logic that is not covered by a builtin.\n\n' +
         '**Code format**: Your code MUST be an async function declaration named `execute`, for example:\n' +
         '```\nasync function execute() {\n    // your logic here\n    return someValue;\n}\n```\n' +
         'Use `return <value>` inside the function to pass a result back. ' +
@@ -133,60 +240,10 @@ function createMcpServer(): InstanceType<typeof McpServer> {
         },
         async ({ code, timeout }) => {
             const result = await executeCode(code, timeout ?? 30);
-
             if (!result.success) {
-                const errorText = `Error: ${result.error}${result.stack ? '\nStack: ' + result.stack : ''}`;
-                return {
-                    content: [{ type: 'text' as const, text: errorText }],
-                    isError: true,
-                };
+                return buildErrorContent(result.error || 'Unknown error', result.stack);
             }
-
-            // Recursively collect all __image markers and strip them from the object.
-            const images: Array<{ base64: string; mimeType: string }> = [];
-            function collectAndStrip(obj: any, visited: Set<any>) {
-                if (!obj || typeof obj !== 'object') return;
-                if (visited.has(obj)) return;
-                visited.add(obj);
-                if (obj.__image && obj.__image.base64) {
-                    images.push({
-                        base64: obj.__image.base64,
-                        mimeType: obj.__image.mediaType || 'image/png',
-                    });
-                    delete obj.__image;
-                }
-                for (const key of Object.keys(obj)) {
-                    collectAndStrip(obj[key], visited);
-                }
-            }
-
-            // Serialize the raw result to text, extracting images from objects.
-            let textContent: string;
-            const raw = result.result;
-            if (raw === undefined) {
-                textContent = '(no return value)';
-            } else if (raw === null) {
-                textContent = 'null';
-            } else if (typeof raw === 'object') {
-                collectAndStrip(raw, new Set());
-                try { textContent = JSON.stringify(raw, null, 2); } catch (_) { textContent = String(raw); }
-            } else {
-                textContent = String(raw);
-            }
-
-            // Build content parts
-            const content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> = [];
-            content.push({ type: 'text' as const, text: textContent });
-
-            for (const img of images) {
-                content.push({
-                    type: 'image' as const,
-                    data: img.base64,
-                    mimeType: img.mimeType,
-                });
-            }
-
-            return { content };
+            return buildSuccessContent(result.result);
         }
     );
 

@@ -8,7 +8,7 @@
 
 `Codex -> 本地 stdio 代理 -> Unity MCP`
 
-代理当前只转发 `evalJsCode`，但会在 Unity 因 C# 编译触发 Domain Reload 后自动执行恢复流程：
+代理当前会转发 `searchBuiltins`、`runBuiltin` 和 `evalJsCode`，并会在 Unity 因 C# 编译触发 Domain Reload 后自动执行恢复流程：
 
 - 调用 `GET /debug/wait-ready`
 - 必要时调用 `POST /debug/reset`
@@ -33,11 +33,11 @@ npm run proxy:verify
 
 这个脚本会自动完成下面这些步骤：
 
-- 连接代理并确认 `evalJsCode` 可用
+- 连接代理并确认 `searchBuiltins`、`runBuiltin`、`evalJsCode` 可用
 - 在目标 Unity 工程里生成临时 smoke C# 文件
 - 通过 `AssetDatabase.Refresh()` 触发真实编译和 Domain Reload
 - 等待 Unity `/debug/wait-ready` 返回 ready
-- 在同一个 MCP 客户端会话里再次调用 `evalJsCode`
+- 在同一个 MCP 客户端会话里再次调用 `evalJsCode` 和 `runBuiltin`
 - 校验新的 smoke marker 已生效
 - 删除临时 smoke 文件并做一次清理刷新
 

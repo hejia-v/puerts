@@ -198,6 +198,13 @@ function normalizeToolText(result) {
         .join('\n');
 }
 
+async function callToolJson(client, name, args) {
+    return JSON.parse(normalizeToolText(await client.callTool({
+        name,
+        arguments: args,
+    })));
+}
+
 async function callEval(client, code, timeout = 30) {
     return client.callTool({
         name: 'evalJsCode',
@@ -286,6 +293,13 @@ async function main() {
         report.healthBefore = await health(options.baseUrl);
         client = await connectProxyClient(options, 'puerts-unity-proxy-verify');
         report.tools = await client.listTools();
+        report.builtinSearch = await callToolJson(client, 'searchBuiltins', {
+            query: 'log',
+            limit: 3,
+        });
+        report.builtinRunBeforeReload = await callToolJson(client, 'runBuiltin', {
+            name: 'unity-log.getUnityLogSummary',
+        });
 
         report.firstCall = JSON.parse(normalizeToolText(await callEval(client, `
             return {
@@ -320,6 +334,9 @@ async function main() {
                 isUpdating: CS.UnityEditor.EditorApplication.isUpdating,
             };
         `, 120)));
+        report.builtinRunAfterReload = await callToolJson(client, 'runBuiltin', {
+            name: 'unity-log.getUnityLogSummary',
+        });
 
         if (report.secondCall.marker !== marker) {
             throw new Error(`Domain reload verification failed: expected marker ${marker}, got ${report.secondCall.marker}`);

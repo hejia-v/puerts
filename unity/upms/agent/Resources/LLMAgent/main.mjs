@@ -37315,6 +37315,10 @@ __name(getResourceRoot, "getResourceRoot");
 // ../ai_shared_src/eval-core.mts
 var jsEnv = null;
 var builtinSummariesText = "";
+var builtinModules = [];
+var builtinFunctions = [];
+var builtinFunctionMap = /* @__PURE__ */ new Map();
+var builtinModuleMap = /* @__PURE__ */ new Map();
 function getJsEnv() {
   if (!jsEnv) {
     jsEnv = CS.LLMAgent.ScriptEnvBridge.CreateJavaScriptEnv();
@@ -37329,7 +37333,237 @@ function getJsEnv() {
   return jsEnv;
 }
 __name(getJsEnv, "getJsEnv");
+function splitSearchTokens(value) {
+  return value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+}
+__name(splitSearchTokens, "splitSearchTokens");
+function uniqueTokens(values) {
+  const seen = /* @__PURE__ */ new Set();
+  const tokens = [];
+  for (const value of values) {
+    if (!seen.has(value)) {
+      seen.add(value);
+      tokens.push(value);
+    }
+  }
+  return tokens;
+}
+__name(uniqueTokens, "uniqueTokens");
+function buildTags(...values) {
+  return uniqueTokens(values.flatMap(splitSearchTokens));
+}
+__name(buildTags, "buildTags");
+function normalizeText(value) {
+  return value.trim().toLowerCase();
+}
+__name(normalizeText, "normalizeText");
+function normalizeCompact(value) {
+  return normalizeText(value).replace(/[^a-z0-9]+/g, "");
+}
+__name(normalizeCompact, "normalizeCompact");
+function extractFunctionDocs(description) {
+  const docs = /* @__PURE__ */ new Map();
+  const lines = description.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.startsWith("- **`")) {
+      continue;
+    }
+    const tickStart = line.indexOf("`");
+    const tickEnd = line.indexOf("`", tickStart + 1);
+    if (tickStart === -1 || tickEnd === -1) {
+      continue;
+    }
+    const signature = line.slice(tickStart + 1, tickEnd).trim();
+    const exportName = signature.split("(")[0].trim();
+    if (!exportName) {
+      continue;
+    }
+    const summary = line.slice(tickEnd + 4).replace(/^[^A-Za-z0-9]+/, "").trim();
+    docs.set(exportName, {
+      signature,
+      summary
+    });
+  }
+  return docs;
+}
+__name(extractFunctionDocs, "extractFunctionDocs");
+function rebuildBuiltinIndexes() {
+  builtinModules = [...builtinModules].sort((a2, b2) => a2.moduleName.localeCompare(b2.moduleName));
+  builtinFunctions = builtinModules.flatMap((moduleInfo) => moduleInfo.functions).sort((a2, b2) => a2.id.localeCompare(b2.id));
+  builtinFunctionMap = new Map(builtinFunctions.map((info) => [info.id, info]));
+  builtinModuleMap = new Map(builtinModules.map((info) => [info.moduleName, info]));
+}
+__name(rebuildBuiltinIndexes, "rebuildBuiltinIndexes");
+function buildBuiltinPromptText(root, modules) {
+  if (modules.length === 0) {
+    return "";
+  }
+  const moduleNames = modules.map((moduleInfo) => `\`${moduleInfo.moduleName}\``).join(", ");
+  return `
+
+### Builtins
+
+Preloaded helper modules are available under \`${root}/builtins/*.mjs\`.
+
+Prefer \`runBuiltin\` for known helper calls and \`searchBuiltins\` when you need to discover the right helper first. Use \`evalJsCode\` as the fallback for custom or multi-step logic that is not covered by a builtin.
+
+Builtin modules currently loaded: ${moduleNames}`;
+}
+__name(buildBuiltinPromptText, "buildBuiltinPromptText");
+function toSearchResult(info) {
+  return {
+    name: info.id,
+    moduleName: info.moduleName,
+    exportName: info.exportName,
+    signature: info.signature,
+    summary: info.summary,
+    tags: [...info.tags]
+  };
+}
+__name(toSearchResult, "toSearchResult");
+function scoreBuiltin(info, query, queryCompact) {
+  if (!query) {
+    return 1;
+  }
+  const idLower = normalizeText(info.id);
+  const exportLower = normalizeText(info.exportName);
+  const moduleLower = normalizeText(info.moduleName);
+  const signatureLower = normalizeText(info.signature);
+  const searchText = info.searchText;
+  let score = 0;
+  if (normalizeCompact(info.id) === queryCompact) score += 200;
+  if (normalizeCompact(info.exportName) === queryCompact) score += 180;
+  if (normalizeCompact(info.moduleName) === queryCompact) score += 140;
+  if (idLower === query) score += 120;
+  if (exportLower === query) score += 100;
+  if (moduleLower === query) score += 80;
+  if (idLower.startsWith(query)) score += 50;
+  if (exportLower.startsWith(query)) score += 40;
+  if (moduleLower.startsWith(query)) score += 30;
+  if (signatureLower.includes(query)) score += 20;
+  if (searchText.includes(query)) score += 10;
+  for (const token of splitSearchTokens(query)) {
+    if (info.tags.includes(token)) score += 12;
+    else if (searchText.includes(token)) score += 4;
+  }
+  return score;
+}
+__name(scoreBuiltin, "scoreBuiltin");
+function resolveBuiltin(name21) {
+  const trimmed = name21.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const direct = builtinFunctionMap.get(trimmed);
+  if (direct) {
+    return {
+      moduleName: direct.moduleName,
+      exportName: direct.exportName,
+      info: direct
+    };
+  }
+  const compactName = normalizeCompact(trimmed);
+  const exactByExport = builtinFunctions.filter((info2) => normalizeCompact(info2.exportName) === compactName);
+  if (exactByExport.length === 1) {
+    const info2 = exactByExport[0];
+    return {
+      moduleName: info2.moduleName,
+      exportName: info2.exportName,
+      info: info2
+    };
+  }
+  const dotIndex = trimmed.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex >= trimmed.length - 1) {
+    return null;
+  }
+  const moduleName = trimmed.slice(0, dotIndex);
+  const exportName = trimmed.slice(dotIndex + 1);
+  const moduleInfo = builtinModuleMap.get(moduleName);
+  if (!moduleInfo) {
+    return null;
+  }
+  const info = moduleInfo.functions.find((item) => item.exportName === exportName);
+  if (!info) {
+    return null;
+  }
+  return {
+    moduleName,
+    exportName,
+    info
+  };
+}
+__name(resolveBuiltin, "resolveBuiltin");
+function buildBuiltinRunnerCode(moduleName, exportName, args) {
+  const root = getResourceRoot();
+  if (!root) {
+    throw new Error("Resource root not set. Builtins are unavailable until initialization completes.");
+  }
+  const moduleSpecifier = `${root}/builtins/${moduleName}.mjs`;
+  let serializedArgs;
+  try {
+    serializedArgs = JSON.stringify(args === void 0 ? [] : Array.isArray(args) ? args : [args]);
+  } catch (error48) {
+    throw new Error(`runBuiltin args must be JSON-serializable: ${error48?.message || String(error48)}`);
+  }
+  return `async function execute() {
+    const moduleName = ${JSON.stringify(moduleName)};
+    const exportName = ${JSON.stringify(exportName)};
+    const mod = await import(${JSON.stringify(moduleSpecifier)});
+    const fn = mod[exportName];
+    if (typeof fn !== 'function') {
+        throw new Error(\`Builtin '\${moduleName}.\${exportName}' is not callable.\`);
+    }
+    const args = ${serializedArgs};
+    return await fn.apply(mod, args);
+}
+`;
+}
+__name(buildBuiltinRunnerCode, "buildBuiltinRunnerCode");
+function searchBuiltins(query = "", tags, limit = 8) {
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(50, Math.floor(limit))) : 8;
+  const normalizedQuery = normalizeText(query || "");
+  const queryCompact = normalizeCompact(query || "");
+  const requestedTags = uniqueTokens((tags ?? []).flatMap(splitSearchTokens));
+  const matches = builtinFunctions.map((info) => {
+    const score = scoreBuiltin(info, normalizedQuery, queryCompact);
+    const tagMatch = requestedTags.length === 0 || requestedTags.every((tag) => info.tags.includes(tag) || info.searchText.includes(tag));
+    return { info, score, tagMatch };
+  }).filter((entry) => entry.tagMatch && (normalizedQuery === "" || entry.score > 0)).sort((a2, b2) => {
+    if (b2.score !== a2.score) return b2.score - a2.score;
+    return a2.info.id.localeCompare(b2.info.id);
+  }).slice(0, safeLimit).map((entry) => toSearchResult(entry.info));
+  return matches;
+}
+__name(searchBuiltins, "searchBuiltins");
+async function runBuiltin(name21, args, timeoutSeconds = 30) {
+  const target = resolveBuiltin(name21);
+  if (!target) {
+    const suggestions = searchBuiltins(name21, void 0, 5).map((item) => item.name);
+    const suffix = suggestions.length > 0 ? ` Closest matches: ${suggestions.join(", ")}.` : "";
+    return {
+      success: false,
+      error: `Builtin '${name21}' was not found.${suffix}`
+    };
+  }
+  try {
+    const code = buildBuiltinRunnerCode(target.moduleName, target.exportName, args);
+    return await executeCode(code, timeoutSeconds);
+  } catch (error48) {
+    return {
+      success: false,
+      error: error48?.message || String(error48),
+      stack: error48?.stack || ""
+    };
+  }
+}
+__name(runBuiltin, "runBuiltin");
 async function initBuiltins() {
+  builtinModules = [];
+  builtinFunctions = [];
+  builtinFunctionMap = /* @__PURE__ */ new Map();
+  builtinModuleMap = /* @__PURE__ */ new Map();
+  builtinSummariesText = "";
   const root = getResourceRoot();
   if (!root) {
     console.warn("[EvalCore] Resource root not set, skipping builtins loading.");
@@ -37342,12 +37576,37 @@ async function initBuiltins() {
     console.log(`[EvalCore] No builtins assets found at Resources/${builtinPath}/`);
     return;
   }
-  const specifiers = [];
+  const modules = [];
   for (let i2 = 0; i2 < assets.Length; i2++) {
     const asset = assets.get_Item(i2);
-    specifiers.push(`${builtinPath}/${asset.name}.mjs`);
+    modules.push({
+      moduleName: asset.name,
+      specifier: `${builtinPath}/${asset.name}.mjs`
+    });
   }
-  const importEntries = specifiers.map((s2, idx) => `import('${s2}').then(function(m) { return { index: ${idx}, specifier: '${s2}', summary: m.summary || '', error: null }; }).catch(function(e) { return { index: ${idx}, specifier: '${s2}', summary: '', error: String(e.message || e) }; })`).join(",\n        ");
+  const importEntries = modules.map((entry, index) => `import(${JSON.stringify(entry.specifier)}).then(function(m) {
+    return {
+        index: ${index},
+        moduleName: ${JSON.stringify(entry.moduleName)},
+        specifier: ${JSON.stringify(entry.specifier)},
+        summary: typeof m.summary === 'string' ? m.summary : '',
+        description: typeof m.description === 'string' ? m.description : '',
+        tags: Array.isArray(m.tags) ? m.tags.map(function(value) { return String(value); }) : [],
+        functionNames: Object.keys(m).filter(function(key) { return typeof m[key] === 'function'; }),
+        error: null
+    };
+}).catch(function(e) {
+    return {
+        index: ${index},
+        moduleName: ${JSON.stringify(entry.moduleName)},
+        specifier: ${JSON.stringify(entry.specifier)},
+        summary: '',
+        description: '',
+        tags: [],
+        functionNames: [],
+        error: String(e.message || e)
+    };
+})`).join(",\n        ");
   const batchScript = `(function(onFinish) {
     Promise.all([
         ${importEntries}
@@ -37364,54 +37623,51 @@ async function initBuiltins() {
       }
     });
   });
-  const summaries = [];
+  const loadedModules = [];
   for (const entry of results) {
     if (entry.error) {
       console.warn(`[EvalCore] Failed to load builtins module '${entry.specifier}': ${entry.error}`);
-    } else {
-      if (entry.summary) {
-        summaries.push(entry.summary);
-      }
-      console.log(`[EvalCore] Loaded builtins module '${entry.specifier}'.`);
+      continue;
     }
+    const functionDocs = extractFunctionDocs(entry.description);
+    const moduleTags = uniqueTokens([
+      ...buildTags(entry.moduleName, entry.summary, entry.description),
+      ...(entry.tags ?? []).flatMap(splitSearchTokens)
+    ]);
+    const functions = entry.functionNames.map((exportName) => {
+      const doc = functionDocs.get(exportName);
+      const signature = doc?.signature || `${exportName}(...)`;
+      const summary = doc?.summary || `Call ${entry.moduleName}.${exportName}.`;
+      const tags = uniqueTokens([
+        ...moduleTags,
+        ...buildTags(exportName, signature, summary)
+      ]);
+      return {
+        id: `${entry.moduleName}.${exportName}`,
+        moduleName: entry.moduleName,
+        exportName,
+        signature,
+        summary,
+        tags,
+        searchText: normalizeText(
+          `${entry.moduleName} ${exportName} ${signature} ${summary} ${entry.summary} ${entry.description} ${tags.join(" ")}`
+        )
+      };
+    });
+    loadedModules.push({
+      moduleName: entry.moduleName,
+      specifier: entry.specifier,
+      summary: entry.summary,
+      description: entry.description,
+      tags: moduleTags,
+      functions
+    });
+    console.log(`[EvalCore] Loaded builtins module '${entry.specifier}' with ${functions.length} function(s).`);
   }
-  builtinSummariesText = summaries.length > 0 ? `
-
-### Built-in Helper Modules
-
-Several helper modules are pre-loaded in the evalJsCode VM under the path prefix \`${builtinPath}/\`. Each module exports:
-- **\`description\`** \u2014 a detailed string documenting every function signature and usage.
-- **Named functions** \u2014 the actual helper functions you can call.
-
-To use a module, load it via ESM dynamic \`import()\`.
-
-**IMPORTANT**: On first use of a module, read its \`.description\` export to see detailed function signatures. After that, you already know the API \u2014 just call functions directly without re-reading \`.description\`.
-All functions validate their arguments at runtime and will throw errors if called with wrong parameters.
-
-**Examples below are illustrative only** \u2014 replace \`<module-A>\`, \`<module-B>\`, and function names with the actual modules and APIs listed in "Available modules" below.
-
-First-time usage \u2014 read description:
-\`\`\`
-async function execute() {
-    const mod = await import('${builtinPath}/<module-A>.mjs');
-    return mod.description;
-}
-\`\`\`
-
-After you know the API, call functions directly (you can combine MULTIPLE operations in one script):
-\`\`\`
-async function execute() {
-    const a = await import('${builtinPath}/<module-A>.mjs');
-    const b = await import('${builtinPath}/<module-B>.mjs');
-    a.someFunction('arg');
-    return await b.anotherFunction();
-}
-\`\`\`
-
-Available modules:
-
-` + summaries.join("\n\n") : "";
-  console.log(`[EvalCore] Loaded ${summaries.length} builtins summary(s).`);
+  builtinModules = loadedModules;
+  rebuildBuiltinIndexes();
+  builtinSummariesText = buildBuiltinPromptText(root, builtinModules);
+  console.log(`[EvalCore] Loaded ${builtinModules.length} builtins module(s), ${builtinFunctions.length} callable(s).`);
 }
 __name(initBuiltins, "initBuiltins");
 var RUNNER_CODE = `(function(onFinish) {
@@ -37472,13 +37728,132 @@ ${code}`);
 __name(executeCode, "executeCode");
 
 // src/tools/eval-tool.mts
+function toModelFriendlyOutput(output) {
+  if (output && typeof output === "object" && typeof output.success === "boolean") {
+    let collectAndStrip2 = function(obj, visited) {
+      if (!obj || typeof obj !== "object") return;
+      if (visited.has(obj)) return;
+      visited.add(obj);
+      if (obj.__image && obj.__image.base64) {
+        images.push({
+          base64: obj.__image.base64,
+          mediaType: obj.__image.mediaType || "image/png"
+        });
+        delete obj.__image;
+      }
+      for (const key of Object.keys(obj)) {
+        collectAndStrip2(obj[key], visited);
+      }
+    };
+    var collectAndStrip = collectAndStrip2;
+    __name(collectAndStrip2, "collectAndStrip");
+    if (!output.success) {
+      return {
+        type: "text",
+        value: `Error: ${output.error}${output.stack ? "\nStack: " + output.stack : ""}`
+      };
+    }
+    const result = output.result;
+    const images = [];
+    let textContent2;
+    if (result === void 0) {
+      textContent2 = "(no return value)";
+    } else if (result === null) {
+      textContent2 = "null";
+    } else if (typeof result === "object") {
+      collectAndStrip2(result, /* @__PURE__ */ new Set());
+      try {
+        textContent2 = JSON.stringify(result, null, 2);
+      } catch (_2) {
+        textContent2 = String(result);
+      }
+    } else {
+      textContent2 = String(result);
+    }
+    if (images.length > 0) {
+      console.log(`[Eval] toModelOutput: including ${images.length} image(s)`);
+      return {
+        type: "content",
+        value: [
+          { type: "text", text: textContent2 },
+          ...images.map((img) => ({
+            type: "file-data",
+            data: img.base64,
+            mediaType: img.mediaType
+          }))
+        ]
+      };
+    }
+    return {
+      type: "text",
+      value: textContent2
+    };
+  }
+  let textContent;
+  if (output === void 0) {
+    textContent = "(no return value)";
+  } else if (output === null) {
+    textContent = "null";
+  } else if (typeof output === "object") {
+    try {
+      textContent = JSON.stringify(output, null, 2);
+    } catch (_2) {
+      textContent = String(output);
+    }
+  } else {
+    textContent = String(output);
+  }
+  return {
+    type: "text",
+    value: textContent
+  };
+}
+__name(toModelFriendlyOutput, "toModelFriendlyOutput");
 function createEvalTools() {
   return {
+    /**
+     * Discover builtin helper calls without expanding every helper into its own tool.
+     */
+    searchBuiltins: tool({
+      description: "Search the compact builtin helper registry. Use this when you need to discover the right preloaded helper first. The result returns exact builtin names you can pass to `runBuiltin`.",
+      inputSchema: external_exports.object({
+        query: external_exports.string().optional().default("").describe("Search text. Match against builtin name, module name, signature, and short summary."),
+        tags: external_exports.array(external_exports.string()).optional().describe("Optional keyword filters. These are treated as lightweight tags/keywords."),
+        limit: external_exports.number().int().min(1).max(50).optional().default(8).describe("Maximum number of search results to return. Default is 8.")
+      }),
+      execute: /* @__PURE__ */ __name(async ({ query, tags, limit }) => {
+        return {
+          results: searchBuiltins(query ?? "", tags, limit ?? 8)
+        };
+      }, "execute"),
+      toModelOutput({ output }) {
+        return toModelFriendlyOutput(output);
+      }
+    }),
+    /**
+     * Run a known builtin by exact name.
+     */
+    runBuiltin: tool({
+      description: 'Run a preloaded builtin helper by exact name, usually after `searchBuiltins`. Use this for common Unity/editor helper operations instead of writing custom `evalJsCode`. Pass positional parameters as an array in `args`, for example `["forward", 1]`; pass a single object or primitive directly when the builtin takes one argument.' + builtinSummariesText,
+      inputSchema: external_exports.object({
+        name: external_exports.string().describe(
+          "Exact builtin name, usually in `moduleName.exportName` form, for example `unity-log.getUnityLogSummary` or `scene-view.getSceneViewState`."
+        ),
+        args: external_exports.any().optional().describe("Optional builtin arguments. Use an array for positional arguments."),
+        timeout: external_exports.number().optional().default(30).describe("Execution timeout in seconds. Default is 30s.")
+      }),
+      execute: /* @__PURE__ */ __name(async ({ name: name21, args, timeout }) => {
+        return await runBuiltin(name21, args, timeout ?? 30);
+      }, "execute"),
+      toModelOutput({ output }) {
+        return toModelFriendlyOutput(output);
+      }
+    }),
     /**
      * Evaluate JavaScript code in the PuerTS runtime environment.
      */
     evalJsCode: tool({
-      description: 'Execute JavaScript code in a dedicated PuerTS runtime environment. This VM is separate from the main agent VM but is **reused across calls** \u2014 variables, functions, and state defined in previous calls persist and can be referenced in later calls.\n\nThe code runs inside Unity via PuerTS with full access to the `CS` and `puer` globals (see PuerTS interop rules and runtime environment notes in the system prompt).\n\nUse this tool when you need to inspect or modify Unity scene objects, create/destroy GameObjects or Components, query hierarchies, execute Unity API calls dynamically, or test code snippets in the live environment.\n\n**Code format**: Your code MUST be an async function declaration named `execute`, for example:\n```\nasync function execute() {\n    // your logic here\n    return someValue;\n}\n```\nUse `return <value>` inside the function to pass a result back \u2014 the returned value will appear in the `result` field of the response. If no `return` statement is used, `result` will be "(no return value)". You can return any value directly \u2014 objects, arrays, strings, numbers, etc. The system automatically serializes return values for you. **Do NOT call JSON.stringify() on your return value** \u2014 just return the object directly.\n\nOn success the response is `{ success: true, result: string }`. On failure the response is `{ success: false, error: string, stack: string }`.\n\nUse console.log() for debug output (it goes to the Unity console).' + builtinSummariesText,
+      description: 'Execute JavaScript code in a dedicated PuerTS runtime environment. This VM is separate from the main agent VM but is **reused across calls** \u2014 variables, functions, and state defined in previous calls persist and can be referenced in later calls.\n\nThe code runs inside Unity via PuerTS with full access to the `CS` and `puer` globals (see PuerTS interop rules and runtime environment notes in the system prompt).\n\nPrefer `runBuiltin` for known helper operations and `searchBuiltins` to discover them. Use `evalJsCode` when you need custom composition, arbitrary Unity API access, or logic that is not covered by a builtin.\n\n**Code format**: Your code MUST be an async function declaration named `execute`, for example:\n```\nasync function execute() {\n    // your logic here\n    return someValue;\n}\n```\nUse `return <value>` inside the function to pass a result back \u2014 the returned value will appear in the `result` field of the response. If no `return` statement is used, `result` will be "(no return value)". You can return any value directly \u2014 objects, arrays, strings, numbers, etc. The system automatically serializes return values for you. **Do NOT call JSON.stringify() on your return value** \u2014 just return the object directly.\n\nOn success the response is `{ success: true, result: string }`. On failure the response is `{ success: false, error: string, stack: string }`.\n\nUse console.log() for debug output (it goes to the Unity console).' + builtinSummariesText,
       inputSchema: external_exports.object({
         code: external_exports.string().describe(
           "An async function declaration named `execute`. Example: \"async function execute() {\\n  const go = CS.UnityEngine.GameObject.Find('Main Camera');\\n  return go.transform.position.toString();\\n}\""
@@ -37490,69 +37865,8 @@ function createEvalTools() {
       execute: /* @__PURE__ */ __name(async ({ code, timeout }) => {
         return await executeCode(code, timeout ?? 30);
       }, "execute"),
-      // Convert eval output to model-friendly content.
-      // When the executed code returns an object with an __image marker
-      // (e.g. from the screenshot builtin), the image is included as
-      // file-data so that handlePrepareStep can extract it and inject
-      // it as a user-message image part for the LLM to see.
       toModelOutput({ output }) {
-        if (!output.success) {
-          return {
-            type: "text",
-            value: `Error: ${output.error}${output.stack ? "\nStack: " + output.stack : ""}`
-          };
-        }
-        const result = output.result;
-        const images = [];
-        function collectAndStrip(obj, visited) {
-          if (!obj || typeof obj !== "object") return;
-          if (visited.has(obj)) return;
-          visited.add(obj);
-          if (obj.__image && obj.__image.base64) {
-            images.push({
-              base64: obj.__image.base64,
-              mediaType: obj.__image.mediaType || "image/png"
-            });
-            delete obj.__image;
-          }
-          for (const key of Object.keys(obj)) {
-            collectAndStrip(obj[key], visited);
-          }
-        }
-        __name(collectAndStrip, "collectAndStrip");
-        let textContent;
-        if (result === void 0) {
-          textContent = "(no return value)";
-        } else if (result === null) {
-          textContent = "null";
-        } else if (typeof result === "object") {
-          collectAndStrip(result, /* @__PURE__ */ new Set());
-          try {
-            textContent = JSON.stringify(result, null, 2);
-          } catch (_2) {
-            textContent = String(result);
-          }
-        } else {
-          textContent = String(result);
-        }
-        if (images.length > 0) {
-          console.log(`[Eval] toModelOutput: including ${images.length} image(s)`);
-          return {
-            type: "content",
-            value: [
-              { type: "text", text: textContent },
-              ...images.map((img) => ({
-                type: "file-data",
-                data: img.base64,
-                mediaType: img.mediaType
-              }))
-            ]
-          };
-        }
-        return {
-          type: "text",
-          value: textContent
-        };
+        return toModelFriendlyOutput(output);
       }
     })
   };
@@ -37716,6 +38030,14 @@ The placeholder prefix is unique per session:
 ## Skills (IMPORTANT)
 
 If the \`loadSkill\` tool is available, you **MUST** call it to load the relevant skill **before** performing any task that falls within that skill's domain. For example, if a task involves calling C# APIs from JS via PuerTS, you must first load the corresponding skill to get the correct interop rules. **Never assume you know the correct approach \u2014 always load the skill first.**
+
+## Builtin Routing
+
+If \`runBuiltin\` and \`searchBuiltins\` are available, prefer them over \`evalJsCode\` for common helper actions.
+
+- Use \`runBuiltin\` when you already know the exact builtin name.
+- Use \`searchBuiltins\` only when you need to discover the right builtin first.
+- Use \`evalJsCode\` as the fallback for custom logic, arbitrary composition, or APIs that are not covered by a builtin.
 
 ## evalJsCode Runtime Environment
 
